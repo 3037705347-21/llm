@@ -285,6 +285,35 @@ llm logs backup /tmp/backup.db
 ```
 This uses SQLite [VACUUM INTO](https://sqlite.org/lang_vacuum.html#vacuum_with_an_into_clause) under the hood.
 
+## Merging databases
+
+If you use LLM on more than one machine, you can merge another machine's `logs.db` file into your local one:
+
+```bash
+llm logs merge /path/to/other/logs.db
+```
+
+The merge is designed to be run repeatedly:
+
+- Conversations and messages the two databases share have identical content hashes and are kept once.
+- Threads that exist only on one side are both retained.
+- A thread the other machine had continued past your local copy is fast-forwarded to its newer tip.
+- If a shared thread has genuinely forked - each side continued with different messages after the same point - or the same turn id exists with different content, the **whole** merge is aborted and no changes are made. The error report names every conflicting thread and the point at which the histories diverge.
+
+Because every write is idempotent and the merge runs in a single database transaction, interrupting it and rerunning the command converges on the same result. Merged-in threads keep their original ids and remain fully readable and continuable.
+
+Preview what a merge would do without writing anything:
+
+```bash
+llm logs merge /path/to/other/logs.db --dry-run
+```
+
+Use `--json` for a machine-readable report. By default the local database is modified; pass `-d` to merge into a different file:
+
+```bash
+llm logs merge /path/to/other/logs.db -d /path/to/destination.db --json
+```
+
 (logging-message-store)=
 
 ## The message store

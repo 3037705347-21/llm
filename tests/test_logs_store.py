@@ -17,6 +17,7 @@ import llm
 from llm.cli import cli
 from llm.logs import (
     LogStore,
+    MergeConflict,
     canonical_json,
     log_row_extras,
     merged_log_rows,
@@ -2350,3 +2351,317 @@ class TestLogListingCost:
         message_lookups = [s for s in statements if "from messages" in s]
         # One user and one assistant message per turn, each fetched once
         assert len(message_lookups) <= 2 * turns
+
+
+# ---- merging stores ---------------------------------------------------
+
+
+@pytest.fixture
+def merge_pair(db_factory, tmp_path):
+    "Two file-backed stores and the directory holding them."
+    dest_path = tmp_path / "dest.db"
+    source_path = tmp_path / "source.db"
+    dest = LogStore(db_factory(str(dest_path)))
+    source = LogStore(db_factory(str(source_path)))
+    return dest, source, dest_path, source_path
+
+
+def _identical_thread(dest, source, thread_id, messages, name="Chat"):
+    "Same thread id and history in both stores."
+    dest.create_thread(id=thread_id, name=name)
+    source.create_thread(id=thread_id, name=name)
+    dest.append(thread_id, messages)
+    source.append(thread_id, messages)
+
+
+def _chain_texts(store, thread_id):
+    "Text of every part in the thread's messages, in order."
+    return [
+        part.text
+        for message in store.thread_messages(thread_id)
+        for part in message.parts
+        if getattr(part, "text", None) is not None
+    ]
+
+
+class TestMerge:
+    def test_threads_unique_to_each_side_are_both_kept(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        dest.append(dest.create_thread(id="dest-only"), [llm.user("Local only")])
+        source.append(
+            source.create_thread(id="source-only"), [llm.user("Remote only")]
+        )
+        report = dest.merge(str(source_path))
+        assert report.threads_added == ["source-only"]
+        assert dest.db["threads"].count == 2
+        assert _chain_texts(dest, "source-only") == ["Remote only"]
+        # Destination-only work is untouched
+        assert _chain_texts(dest, "dest-only") == ["Local only"]
+
+    def test_shared_thread_with_identical_history_is_kept_once(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        shared = [llm.user("Question"), llm.assistant("Answer")]
+        _identical_thread(dest, source, "shared-id", shared)
+        message_count = dest.db["messages"].count
+        report = dest.merge(str(source_path))
+        assert report.threads_unchanged == ["shared-id"]
+        assert report.messages_added == 0
+        assert dest.db["messages"].count == message_count
+        assert dest.db["threads"].count == 1
+
+    def test_source_extension_is_fast_forwarded(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        shared = [llm.user("Question"), llm.assistant("Answer")]
+        _identical_thread(dest, source, "shared-id", shared)
+        source.append("shared-id", [llm.user("More"), llm.assistant("More answer")])
+        old_tip = dest.thread_tip("shared-id")
+        report = dest.merge(str(source_path))
+        assert [e["id"] for e in report.threads_extended] == ["shared-id"]
+        assert report.threads_extended[0]["old_tip"] == old_tip
+        # The whole history reads through the single thread
+        assert _chain_texts(dest, "shared-id") == [
+            "Question",
+            "Answer",
+            "More",
+            "More answer",
+        ]
+
+    def test_destination_extension_is_left_untouched(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        shared = [llm.user("Question"), llm.assistant("Answer")]
+        _identical_thread(dest, source, "shared-id", shared)
+        dest.append("shared-id", [llm.user("Local continuation")])
+        message_count = dest.db["messages"].count
+        report = dest.merge(str(source_path))
+        assert report.threads_unchanged == ["shared-id"]
+        assert report.threads_extended == []
+        assert dest.db["messages"].count == message_count
+        assert _chain_texts(dest, "shared-id") == [
+            "Question",
+            "Answer",
+            "Local continuation",
+        ]
+
+    def test_forked_thread_aborts_entire_merge(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        shared = [llm.user("Question"), llm.assistant("Answer")]
+        _identical_thread(dest, source, "shared-id", shared)
+        answer_hash = dest.thread_tip("shared-id")
+        dest.append("shared-id", [llm.user("Local branch")])
+        source.append("shared-id", [llm.user("Remote branch")])
+        local_tip = dest.thread_tip("shared-id")
+        thread_count = dest.db["threads"].count
+        message_count = dest.db["messages"].count
+
+        with pytest.raises(MergeConflict) as caught:
+            dest.merge(str(source_path))
+        (conflict,) = caught.value.conflicts
+        assert conflict["kind"] == "thread"
+        assert conflict["reason"] == "diverged"
+        assert conflict["common_ancestor"] == answer_hash
+        # No half result: the pointer, the counts and integrity all stand.
+        assert dest.thread_tip("shared-id") == local_tip
+        assert dest.db["threads"].count == thread_count
+        assert dest.db["messages"].count == message_count
+        assert dest.verify() == []
+
+    def test_same_turn_id_with_different_rows_aborts(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        dest.create_thread(id="shared-id", name="Chat")
+        source.create_thread(id="shared-id", name="Chat")
+        dest.db.conn.execute(
+            "insert into turns (id, thread_id, model) values (?, ?, ?)",
+            ["turn-1", "shared-id", "model-a"],
+        )
+        source.db.conn.execute(
+            "insert into turns (id, thread_id, model) values (?, ?, ?)",
+            ["turn-1", "shared-id", "model-b"],
+        )
+        dest.db.conn.commit()
+        source.db.conn.commit()
+        with pytest.raises(MergeConflict) as caught:
+            dest.merge(str(source_path))
+        conflict = caught.value.conflicts[0]
+        assert conflict["kind"] == "turn"
+        assert conflict["reason"] == "row"
+        assert "model" in conflict["columns"]
+        assert dest.db["turns"].get("turn-1")["model"] == "model-a"
+
+    def test_attachment_type_clash_aborts(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        dest.db.conn.execute(
+            "insert into attachments (id, type) values (?, ?)", ["att-1", "image/png"]
+        )
+        source.db.conn.execute(
+            "insert into attachments (id, type) values (?, ?)", ["att-1", "text/plain"]
+        )
+        dest.db.conn.commit()
+        source.db.conn.commit()
+        with pytest.raises(MergeConflict) as caught:
+            dest.merge(str(source_path))
+        assert caught.value.conflicts[0] == {
+            "kind": "attachment",
+            "id": "att-1",
+            "reason": "type",
+        }
+
+    def test_merge_is_idempotent_and_picks_up_later_work(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        source.append(
+            source.create_thread(id="source-only"), [llm.user("First remote")]
+        )
+        first = dest.merge(str(source_path))
+        assert first.threads_added == ["source-only"]
+        second = dest.merge(str(source_path))
+        assert second.threads_added == []
+        assert second.turns_added == []
+        assert second.messages_added == 0
+        # The other machine keeps working; a later merge adds only that.
+        old_tip = dest.thread_tip("source-only")
+        source.append("source-only", [llm.user("Second remote")])
+        third = dest.merge(str(source_path))
+        assert third.threads_unchanged == []
+        assert third.threads_extended[0]["old_tip"] == old_tip
+        assert _chain_texts(dest, "source-only") == [
+            "First remote",
+            "Second remote",
+        ]
+
+    def test_interrupted_merge_leaves_nothing_and_rerun_converges(
+        self, merge_pair, monkeypatch
+    ):
+        dest, source, _dest_path, source_path = merge_pair
+        source.append(
+            source.create_thread(id="source-only"), [llm.user("Remote only")]
+        )
+
+        def crash(self, hashes):
+            raise RuntimeError("simulated crash after writes, before commit")
+
+        monkeypatch.setattr(LogStore, "_verify_reach", crash)
+        with pytest.raises(RuntimeError):
+            dest.merge(str(source_path))
+        # The open transaction was rolled back completely
+        assert dest.db["threads"].count == 0
+        assert dest.db["messages"].count == 0
+
+        monkeypatch.undo()
+        report = dest.merge(str(source_path))
+        assert report.threads_added == ["source-only"]
+        assert _chain_texts(dest, "source-only") == ["Remote only"]
+        assert dest.verify() == []
+
+    def test_merged_thread_can_continue(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        source.append(
+            source.create_thread(id="source-only"),
+            [llm.user("Remote history"), llm.assistant("Remote answer")],
+        )
+        dest.merge(str(source_path))
+        dest.append(
+            "source-only", [llm.user("Local follow-up"), llm.assistant("Local reply")]
+        )
+        assert _chain_texts(dest, "source-only") == [
+            "Remote history",
+            "Remote answer",
+            "Local follow-up",
+            "Local reply",
+        ]
+
+    def test_fragment_integer_ids_are_remapped(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        # Occupy id 1 in the destination with unrelated content, so the
+        # source's fragment (its own id 1) must remap to id 2.
+        ensure_fragment(dest.db, "pre-existing fragment on the destination machine")
+        novel = "Call me Ishmael. Some years ago - never mind how long precisely."
+        tip = source.ensure_chain(
+            [llm.user(f"{novel}\nwho?")], fragments=[novel]
+        )
+        source.create_thread(id="novel-chat", name="Novel", tip=tip)
+
+        report = dest.merge(str(source_path))
+        assert report.fragments_added == 1
+
+        # Payload references point at the destination row, not source id 1
+        (part_row,) = dest.db.query(
+            "select payload from parts where message_hash = ?", [tip]
+        )
+        referenced = {
+            piece["fragment"]
+            for piece in json.loads(part_row["payload"])["text_ref"]
+            if "fragment" in piece
+        }
+        assert referenced == {2}
+        (pf_row,) = dest.db.query(
+            """
+            select pf.fragment_id from part_fragments pf
+            join parts p on p.id = pf.part_id
+            where p.message_hash = ?
+            """,
+            [tip],
+        )
+        assert pf_row["fragment_id"] == 2
+        # The reference resolves to the novel and the hash still verifies
+        (message,) = dest.thread_messages("novel-chat")
+        assert message.parts[0].text == f"{novel}\nwho?"
+        assert dest.verify() == []
+
+    def test_dry_run_writes_nothing(self, merge_pair):
+        dest, source, _dest_path, source_path = merge_pair
+        source.append(
+            source.create_thread(id="source-only"), [llm.user("Remote only")]
+        )
+        report = dest.merge(str(source_path), dry_run=True)
+        assert report.dry_run is True
+        assert report.threads_added == ["source-only"]
+        assert dest.db["threads"].count == 0
+        assert dest.db["messages"].count == 0
+        # Nothing about the dry run lingers
+        aliases = {
+            row[1] for row in dest.db.conn.execute("pragma database_list")
+        }
+        assert "merge_source" not in aliases
+
+
+class TestMergeCli:
+    def test_dry_run(self, merge_pair):
+        dest, source, dest_path, source_path = merge_pair
+        source.append(
+            source.create_thread(id="source-only"), [llm.user("Remote only")]
+        )
+        result = CliRunner().invoke(
+            cli,
+            ["logs", "merge", str(source_path), "-d", str(dest_path), "--dry-run"],
+        )
+        assert result.exit_code == 0
+        assert "would merge" in result.output
+        assert "source-only" in result.output
+        # Dry run via CLI leaves the destination empty
+        assert dest.db["threads"].count == 0
+
+    def test_conflict_exits_one(self, merge_pair):
+        dest, source, dest_path, source_path = merge_pair
+        shared = [llm.user("Question"), llm.assistant("Answer")]
+        _identical_thread(dest, source, "shared-id", shared)
+        dest.append("shared-id", [llm.user("Local branch")])
+        source.append("shared-id", [llm.user("Remote branch")])
+        result = CliRunner().invoke(
+            cli, ["logs", "merge", str(source_path), "-d", str(dest_path)]
+        )
+        assert result.exit_code == 1
+        assert "Merge aborted" in result.output
+        assert dest.thread_tip("shared-id") != source.thread_tip("shared-id")
+
+    def test_json_output(self, merge_pair):
+        _dest, source, dest_path, source_path = merge_pair
+        source.append(
+            source.create_thread(id="source-only"), [llm.user("Remote only")]
+        )
+        result = CliRunner().invoke(
+            cli,
+            ["logs", "merge", str(source_path), "-d", str(dest_path), "--json"],
+        )
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is True
+        assert parsed["report"]["threads_added"] == ["source-only"]

@@ -19,6 +19,8 @@ again, so the hash always covers the content as the model saw it -
 import datetime
 import hashlib
 import json
+import pathlib
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from condense_json import UncondenseError, condense_json, uncondense_json
@@ -45,6 +47,8 @@ from .utils import (
 __all__ = [
     "HASH_PREFIX",
     "LogStore",
+    "MergeConflict",
+    "MergeReport",
     "canonical_json",
     "content_hash",
     "message_hash",
@@ -138,6 +142,64 @@ def message_hash(message: Message, parent_hash: str | None) -> str:
         if attachments:
             part_dict["attachments"] = [_canonical_attachment(a) for a in attachments]
     return content_hash({"parent": parent_hash, "message": d})
+
+
+class MergeConflict(Exception):
+    """Raised when an incoming database cannot be reconciled with this one.
+
+    ``conflicts`` lists every disagreement found - divergent threads,
+    same-id turns that disagree, attachment type clashes - so an operator
+    can resolve them all before rerunning. The merge writes nothing:
+    detection finishes before any row is inserted and the whole merge
+    runs in one transaction, so a conflict (or a crash, or power loss)
+    leaves the destination exactly as it was.
+    """
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        super().__init__(
+            "merge aborted with {} conflict(s): {}".format(
+                len(conflicts),
+                "; ".join(
+                    f"{c.get('kind')} {c.get('id')}" for c in conflicts[:5]
+                ),
+            )
+        )
+
+
+@dataclass
+class MergeReport:
+    """What a merge did, or - in a dry run - what it would do.
+
+    Every list is stable across reruns of the same pair of databases:
+    once the two stores agree these counts are all zero except the
+    unchanged lists, which is what makes the merge safe to run
+    repeatedly.
+    """
+
+    dry_run: bool = False
+    # Threads present only in the source - copied whole.
+    threads_added: list[str] = field(default_factory=list)
+    # Threads present in both and already in agreement (including ones
+    # this machine's copy is strictly ahead on).
+    threads_unchanged: list[str] = field(default_factory=list)
+    # Threads the source had continued past this store: id, old and new
+    # tip - the pointer was fast-forwarded.
+    threads_extended: list[dict] = field(default_factory=list)
+    # Turns present only in the source - copied.
+    turns_added: list[str] = field(default_factory=list)
+    # Same-id turns already stored with identical rows.
+    turns_unchanged: list[str] = field(default_factory=list)
+    # Rows added to the content-addressed / shared tables.
+    messages_added: int = 0
+    parts_added: int = 0
+    attachments_added: int = 0
+    fragments_added: int = 0
+    tools_added: int = 0
+    tool_instances_added: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 class LogStore:
@@ -723,6 +785,734 @@ class LogStore:
             for part in chain[-1].parts
             if isinstance(part, ToolCallPart) and not part.server_executed
         ]
+
+    # -- merging -------------------------------------------------------
+
+    def merge(self, source, *, dry_run: bool = False) -> MergeReport:
+        """Merge another ``logs.db`` into this one.
+
+        Safe to run repeatedly: every shared row has content identity
+        (a message hash, a tool/fragment hash, a turn or thread id), so
+        shared parts are written zero times on the second run.
+
+        Threads - the only mutable pointers - are reconciled per id:
+
+        * source-only threads are copied;
+        * identical threads are left alone;
+        * a thread the source had continued past this store - this
+          store's tip lies on the source's chain - is fast-forwarded;
+        * a thread that has genuinely forked (neither tip lies on the
+          other's chain), a same-id turn whose row disagrees, or an
+          attachment id whose media type disagrees aborts the *whole*
+          merge: nothing is written and :class:`MergeConflict` lists
+          every disagreement.
+
+        Everything happens in one transaction. A crash or interrupt
+        mid-merge rolls it back, and because every write is idempotent
+        a rerun converges on the same result. Threads keep their ids
+        and point at the same message rows, so merged-in threads read
+        and continue exactly as native ones.
+
+        Set ``dry_run`` to plan without writing; the returned
+        :class:`MergeReport` is identical in shape either way.
+        """
+        source_path = pathlib.Path(source)
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+        conn = self.db.conn
+        if conn.in_transaction:
+            raise ValueError(
+                "LogStore.merge() needs a connection with no open transaction"
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        attached = False
+        try:
+            existing = {row[1] for row in conn.execute("pragma database_list")}
+            if _MERGE_ALIAS in existing:
+                raise ValueError(
+                    f"database alias {_MERGE_ALIAS!r} is already attached"
+                )
+            uri = source_path.resolve().as_uri() + "?mode=ro"
+            conn.execute(f"ATTACH DATABASE ? AS {_MERGE_ALIAS}", [uri])
+            attached = True
+            self._validate_source()
+            plan = self._plan_merge()
+            if plan["conflicts"]:
+                raise MergeConflict(plan["conflicts"])
+            if not dry_run:
+                self._apply_merge(plan)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            # DETACH must follow commit/rollback: an attached database
+            # that participates in the open write transaction is locked
+            # until the transaction ends.
+            if attached:
+                conn.execute(f"DETACH DATABASE {_MERGE_ALIAS}")
+        report = plan["report"]
+        report.dry_run = dry_run
+        return report
+
+    def _validate_source(self) -> None:
+        "The source must be a logs database at a known schema."
+        tables = {
+            row[0]
+            for row in self.db.conn.execute(
+                f"select name from {_MERGE_ALIAS}.sqlite_master where type = 'table'"
+            )
+        }
+        missing = {"messages", "parts", "threads", "turns"} - tables
+        if missing:
+            raise ValueError(
+                "source database is missing tables: {}".format(
+                    ", ".join(sorted(missing))
+                )
+            )
+
+    def _plan_merge(self) -> dict:
+        """Read-only classification of every shared object.
+
+        Finishes completely before any row is written, so a conflict
+        means the destination is untouched.
+        """
+        conflicts: list[dict] = []
+        report = MergeReport()
+        s = _MERGE_ALIAS + "."
+
+        # New messages, ordered roots-first, plus the dangling check:
+        # a source row whose chain does not reach this store's rows is
+        # corrupt rather than mergeable.
+        reachable = {
+            row["hash"]
+            for row in self.db.query(
+                f"""
+                with recursive reach(hash) as (
+                  select m.hash from {s}messages m
+                  where not exists (select 1 from messages where hash = m.hash)
+                    and (m.parent_hash is null
+                         or exists (select 1 from messages
+                                    where hash = m.parent_hash))
+                  union all
+                  select m.hash from {s}messages m
+                  join reach r on m.parent_hash = r.hash
+                )
+                select hash from reach
+                """
+            )
+        }
+        new_messages = {
+            row["hash"]
+            for row in self.db.query(
+                f"select hash from {s}messages"
+                " where hash not in (select hash from messages)"
+            )
+        }
+        dangling = new_messages - reachable
+        for hash in sorted(dangling):
+            conflicts.append({"kind": "message", "id": hash, "reason": "dangling"})
+        report.messages_added = len(reachable)
+
+        # Threads
+        threads_added = [
+            row["id"]
+            for row in self.db.query(
+                f"select id from {s}threads"
+                " where id not in (select id from threads) order by id"
+            )
+        ]
+        report.threads_added = threads_added
+        for row in self.db.query(
+            f"""
+            select d.id as id,
+                   d.name as d_name, d.tip_message_hash as d_tip,
+                   d.forked_from as d_forked,
+                   src.name as s_name, src.tip_message_hash as s_tip,
+                   src.forked_from as s_forked
+            from {s}threads src join threads d on d.id = src.id
+            order by d.id
+            """
+        ):
+            same_meta = (
+                row["d_name"] == row["s_name"]
+                and row["d_forked"] == row["s_forked"]
+            )
+            if row["d_tip"] == row["s_tip"]:
+                if same_meta:
+                    report.threads_unchanged.append(row["id"])
+                else:
+                    conflicts.append(
+                        {
+                            "kind": "thread",
+                            "id": row["id"],
+                            "reason": "metadata",
+                            "destination": {
+                                "name": row["d_name"],
+                                "forked_from": row["d_forked"],
+                            },
+                            "source": {
+                                "name": row["s_name"],
+                                "forked_from": row["s_forked"],
+                            },
+                        }
+                    )
+                continue
+            d_anc = _ancestor_hashes(self.db, "", row["d_tip"])
+            s_anc = _ancestor_hashes(self.db, s, row["s_tip"])
+            if row["d_tip"] is None or row["d_tip"] in s_anc:
+                # The source continues strictly past this store.
+                report.threads_extended.append(
+                    {
+                        "id": row["id"],
+                        "old_tip": row["d_tip"],
+                        "new_tip": row["s_tip"],
+                    }
+                )
+            elif row["s_tip"] is None or row["s_tip"] in d_anc:
+                # This store is the one that is ahead.
+                report.threads_unchanged.append(row["id"])
+            else:
+                conflicts.append(
+                    _fork_conflict(
+                        self.db, s, row["id"],
+                        row["d_tip"], row["s_tip"], d_anc,
+                    )
+                )
+
+        # Turns
+        turns_added = [
+            row["id"]
+            for row in self.db.query(
+                f"select id from {s}turns"
+                " where id not in (select id from turns) order by id"
+            )
+        ]
+        report.turns_added = turns_added
+        equal_turns: list[str] = []
+        for row in self.db.query(
+            f"""
+            select d.id as id,
+                   {", ".join(f"d.{c} as d_{c}, src.{c} as s_{c}"
+                              for c in _TURN_COMPARE_COLUMNS)}
+            from {s}turns src join turns d on d.id = src.id
+            order by d.id
+            """
+        ):
+            differing = [
+                c
+                for c in _TURN_COMPARE_COLUMNS
+                if row[f"d_{c}"] != row[f"s_{c}"]
+            ]
+            if differing:
+                conflicts.append(
+                    {
+                        "kind": "turn",
+                        "id": row["id"],
+                        "reason": "row",
+                        "columns": differing,
+                    }
+                )
+            else:
+                equal_turns.append(row["id"])
+        # A turns row can agree while its provenance rows disagree.
+        d_keys = _turn_child_keys(self.db, "", equal_turns)
+        s_keys = _turn_child_keys(self.db, s, equal_turns)
+        for turn_id in equal_turns:
+            if d_keys[turn_id] != s_keys[turn_id]:
+                conflicts.append(
+                    {
+                        "kind": "turn",
+                        "id": turn_id,
+                        "reason": "provenance",
+                        "destination": sorted(d_keys[turn_id]),
+                        "source": sorted(s_keys[turn_id]),
+                    }
+                )
+            else:
+                report.turns_unchanged.append(turn_id)
+
+        # Attachments with clashing media types: identical bytes, but
+        # the message hash covers the model-visible type, so keeping one
+        # row would break verify() for one side's messages.
+        for row in self.db.query(
+            f"""
+            select a.id from {s}attachments a
+            join attachments dest on dest.id = a.id
+            where ifnull(a.type, '') != ifnull(dest.type, '')
+            """
+        ):
+            conflicts.append(
+                {"kind": "attachment", "id": row["id"], "reason": "type"}
+            )
+
+        # Counts for the shared tables (counted pre-write).
+        report.attachments_added = self._source_count(
+            f"{s}attachments", "id", "attachments", "id"
+        )
+        report.fragments_added = self._source_count(
+            f"{s}fragments", "hash", "fragments", "hash"
+        )
+        report.tools_added = self._source_count(
+            f"{s}tools", "hash", "tools", "hash"
+        )
+        report.tool_instances_added = self.db.execute(
+            f"""
+            select count(*) as n from {s}tool_instances src
+            where not exists (
+                select 1 from tool_instances t
+                where t.name is src.name
+                  and t.plugin is src.plugin
+                  and t.arguments is src.arguments
+            )
+            """
+        ).fetchone()[0]
+        report.parts_added = self.db.execute(
+            f"""
+            select count(*) as n from {s}parts
+            where message_hash in (
+                select hash from {s}messages
+                where hash not in (select hash from messages)
+            )
+            """
+        ).fetchone()[0]
+
+        return {
+            "conflicts": conflicts,
+            "new_messages": sorted(new_messages),
+            "reach_messages": sorted(reachable),
+            "threads_added": threads_added,
+            "turns_added": turns_added,
+            "report": report,
+        }
+
+    def _source_count(
+        self, source_table, source_col, dest_table, dest_col
+    ) -> int:
+        return self.db.execute(
+            f"select count(*) from {source_table}"
+            f" where {source_col} not in (select {dest_col} from {dest_table})"
+        ).fetchone()[0]
+
+    def _apply_merge(self, plan: dict) -> None:
+        """Copy every agreed-new row, in foreign-key order.
+
+        All writes are idempotent, so this same sequence is what a
+        rerun after an interrupt walks again (finding nothing new).
+        """
+        s = _MERGE_ALIAS + "."
+        reach = plan["reach_messages"]
+        conn = self.db.conn
+
+        # Scratch tables scope the set-based copies to this merge's
+        # rows; they are dropped again before commit.
+        conn.execute("create temp table _merge_new_messages (hash text primary key)")
+        conn.executemany(
+            "insert or ignore into _merge_new_messages(hash) values (?)",
+            [(h,) for h in reach],
+        )
+        conn.execute("create temp table _merge_new_turns (id text primary key)")
+        conn.executemany(
+            "insert or ignore into _merge_new_turns(id) values (?)",
+            [(t,) for t in plan["turns_added"]],
+        )
+
+        try:
+            # Content-addressed / shared tables first.
+            conn.execute(
+                """
+                insert or ignore into attachments (id, type, path, url, content)
+                select id, type, path, url, content from merge_source.attachments
+                """
+            )
+            conn.execute(
+                """
+                insert into fragments (hash, content, datetime_utc, source)
+                select hash, content, datetime('now'), source
+                from merge_source.fragments
+                where hash not in (select hash from fragments)
+                """
+            )
+            conn.execute(
+                """
+                insert into tools (hash, name, description, input_schema, plugin)
+                select hash, name, description, input_schema, plugin
+                from merge_source.tools
+                where hash not in (select hash from tools)
+                """
+            )
+            conn.execute(
+                """
+                insert into tool_instances (name, plugin, arguments)
+                select src.name, src.plugin, src.arguments
+                from merge_source.tool_instances src
+                where not exists (
+                    select 1 from tool_instances t
+                    where t.name is src.name
+                      and t.plugin is src.plugin
+                      and t.arguments is src.arguments
+                )
+                """
+            )
+
+            # Messages roots-first, so every self-FK already resolves
+            # within the statement.
+            conn.execute(
+                """
+                with recursive new(hash, parent_hash, role, provider_metadata) as (
+                  select m.hash, m.parent_hash, m.role, m.provider_metadata
+                    from merge_source.messages m
+                   where m.hash in (select hash from _merge_new_messages)
+                     and (m.parent_hash is null
+                          or exists (select 1 from messages
+                                     where hash = m.parent_hash))
+                  union all
+                  select m.hash, m.parent_hash, m.role, m.provider_metadata
+                    from merge_source.messages m join new n
+                      on m.parent_hash = n.hash
+                )
+                insert into messages (hash, parent_hash, role, provider_metadata)
+                select hash, parent_hash, role, provider_metadata from new
+                """
+            )
+
+            # Parts: only payload text_ref fragment ids need rewriting
+            # (integer ids differ between stores).
+            fragment_map = {
+                row["src"]: row["dst"]
+                for row in self.db.query(
+                    """
+                    select sf.id as src, f.id as dst
+                    from merge_source.fragments sf
+                    join fragments f on f.hash = sf.hash
+                    """
+                )
+            }
+            for row in self.db.query(
+                """
+                select message_hash, position, type, tool_name, text, payload
+                from merge_source.parts
+                where message_hash in (select hash from _merge_new_messages)
+                order by message_hash, position
+                """
+            ):
+                payload = row["payload"]
+                if payload is not None:
+                    payload = _remap_part_payload(payload, fragment_map)
+                conn.execute(
+                    """
+                    insert into parts
+                        (message_hash, position, type, tool_name, text, payload)
+                    values (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        row["message_hash"],
+                        row["position"],
+                        row["type"],
+                        row["tool_name"],
+                        row["text"],
+                        payload,
+                    ],
+                )
+
+            # Part provenance joins: part via (message_hash, position);
+            # fragments via their content hash; attachment ids are
+            # content-addressed and already aligned.
+            conn.execute(
+                """
+                insert into part_attachments (part_id, attachment_id, "order")
+                select np.id, pa.attachment_id, pa."order"
+                from merge_source.part_attachments pa
+                join merge_source.parts sp on sp.id = pa.part_id
+                join parts np on np.message_hash = sp.message_hash
+                              and np.position = sp.position
+                where sp.message_hash in (select hash from _merge_new_messages)
+                """
+            )
+            conn.execute(
+                """
+                insert into part_fragments (part_id, fragment_id, "order")
+                select np.id, df.id, pf."order"
+                from merge_source.part_fragments pf
+                join merge_source.parts sp on sp.id = pf.part_id
+                join merge_source.fragments sf on sf.id = pf.fragment_id
+                join fragments df on df.hash = sf.hash
+                join parts np on np.message_hash = sp.message_hash
+                              and np.position = sp.position
+                where sp.message_hash in (select hash from _merge_new_messages)
+                """
+            )
+
+            # Threads: copy source-only, fast-forward the extended ones
+            # (taking the source row's later metadata).
+            conn.execute(
+                """
+                insert into threads (id, name, tip_message_hash, forked_from,
+                                     datetime_utc)
+                select id, name, tip_message_hash, forked_from, datetime_utc
+                from merge_source.threads
+                where id in (
+                    select id from merge_source.threads
+                    where id not in (select id from threads)
+                )
+                """
+            )
+            for entry in plan["report"].threads_extended:
+                source_row = next(
+                    self.db.query(
+                        "select name, forked_from from merge_source.threads"
+                        " where id = ?",
+                        [entry["id"]],
+                    )
+                )
+                conn.execute(
+                    "update threads set tip_message_hash = ?, name = ?,"
+                    " forked_from = ? where id = ?",
+                    [
+                        entry["new_tip"],
+                        source_row["name"],
+                        source_row["forked_from"],
+                        entry["id"],
+                    ],
+                )
+
+            # Turns, then their provenance rows with ids remapped.
+            conn.execute(
+                f"""
+                insert into turns ({", ".join(_TURN_COLUMNS)})
+                select {", ".join(_TURN_COLUMNS)}
+                from {s}turns
+                where id in (select id from _merge_new_turns)
+                """
+            )
+            conn.execute(
+                """
+                insert into turn_tools (turn_id, tool_id, instance_id)
+                select tt.turn_id, dt.id, di.id
+                from merge_source.turn_tools tt
+                join merge_source.tools st on st.id = tt.tool_id
+                join tools dt on dt.hash = st.hash
+                left join merge_source.tool_instances si
+                    on si.id = tt.instance_id
+                left join tool_instances di
+                    on di.name is si.name
+                   and di.plugin is si.plugin
+                   and di.arguments is si.arguments
+                where tt.turn_id in (select id from _merge_new_turns)
+                """
+            )
+            conn.execute(
+                """
+                insert into turn_fragments (turn_id, fragment_id, "order", kind)
+                select tf.turn_id, df.id, tf."order", tf.kind
+                from merge_source.turn_fragments tf
+                join merge_source.fragments sf on sf.id = tf.fragment_id
+                join fragments df on df.hash = sf.hash
+                where tf.turn_id in (select id from _merge_new_turns)
+                """
+            )
+            conn.execute(
+                """
+                insert into tool_instantiations
+                    (turn_id, tool_call_id, instance_id)
+                select ti.turn_id, ti.tool_call_id, di.id
+                from merge_source.tool_instantiations ti
+                left join merge_source.tool_instances si
+                    on si.id = ti.instance_id
+                left join tool_instances di
+                    on di.name is si.name
+                   and di.plugin is si.plugin
+                   and di.arguments is si.arguments
+                where ti.turn_id in (select id from _merge_new_turns)
+                """
+            )
+            # Derived search text - the same refresh the normal log
+            # path runs; triggers keep the FTS index in step.
+            for turn_id in plan["turns_added"]:
+                self.db.execute(TURN_SEARCH_INSERT_SQL, {"turn_id": turn_id})
+
+            # Integrity: every newly merged message must re-hash to
+            # exactly the identity it arrived with.
+            self._verify_reach(plan["new_messages"])
+        finally:
+            conn.execute("drop table if exists temp._merge_new_messages")
+            conn.execute("drop table if exists temp._merge_new_turns")
+
+    def _verify_reach(self, hashes) -> None:
+        """Like verify() but scoped to this merge's new messages."""
+        broken: list[dict] = []
+        for start in range(0, len(hashes), _VERIFY_CHUNK):
+            chunk = hashes[start : start + _VERIFY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = {
+                row["hash"]: row
+                for row in self.db.query(
+                    f"select * from messages where hash in ({placeholders})",
+                    chunk,
+                )
+            }
+            parts_by_message = self._load_parts(chunk)
+            for hash in chunk:
+                row = rows.get(hash)
+                if row is None:
+                    broken.append({"kind": "message", "id": hash, "reason": "missing"})
+                    continue
+                message = Message(
+                    role=row["role"],
+                    parts=parts_by_message.get(hash, []),
+                    provider_metadata=_load(row["provider_metadata"]),
+                )
+                if message_hash(message, row["parent_hash"]) != hash:
+                    broken.append(
+                        {"kind": "message", "id": hash, "reason": "integrity"}
+                    )
+        if broken:
+            raise MergeConflict(broken)
+
+
+# -- merge internals ----------------------------------------------------
+
+_MERGE_ALIAS = "merge_source"
+_VERIFY_CHUNK = 400
+
+_TURN_COLUMNS = [
+    "id",
+    "thread_id",
+    "parent_message_hash",
+    "tip_message_hash",
+    "model",
+    "resolved_model",
+    "options_json",
+    "schema_id",
+    "input_tokens",
+    "output_tokens",
+    "token_details",
+    "duration_ms",
+    "datetime_utc",
+    "response_json",
+]
+_TURN_COMPARE_COLUMNS = [c for c in _TURN_COLUMNS if c != "id"]
+
+
+def _ancestor_hashes(db, schema: str, tip: str | None) -> set[str]:
+    "Every message hash on the chain from ``tip`` (inclusive) downward."
+    out: set[str] = set()
+    while tip and tip not in out:
+        out.add(tip)
+        rows = list(
+            db.query(
+                f"select parent_hash from {schema}messages where hash = ?", [tip]
+            )
+        )
+        if not rows:
+            break
+        tip = rows[0]["parent_hash"]
+    return out
+
+
+def _ancestor_list(db, schema: str, tip: str | None) -> list[str]:
+    "Chain from ``tip`` to its root, in that order, for locating a fork."
+    out: list[str] = []
+    seen: set[str] = set()
+    while tip and tip not in seen:
+        seen.add(tip)
+        out.append(tip)
+        rows = list(
+            db.query(
+                f"select parent_hash from {schema}messages where hash = ?", [tip]
+            )
+        )
+        if not rows:
+            break
+        tip = rows[0]["parent_hash"]
+    return out
+
+
+def _fork_conflict(db, source_schema: str, thread_id: str,
+                   d_tip: str, s_tip: str, d_anc: set[str]) -> dict:
+    """Build the conflict record for a genuinely forked thread.
+
+    Walks each side to its root, finds the last common ancestor and the
+    first message after it on each chain - the exact point an operator
+    needs to inspect to reconcile by hand.
+    """
+    s_list = _ancestor_list(db, source_schema, s_tip)
+    lca = next((h for h in s_list if h in d_anc), None)
+    s_index = s_list.index(lca) if lca is not None else len(s_list)
+    s_div = s_list[s_index - 1] if s_index > 0 else None
+    d_list = _ancestor_list(db, "", d_tip)
+    d_div = None
+    for index, hash in enumerate(d_list):
+        if hash == lca:
+            d_div = d_list[index - 1] if index > 0 else None
+            break
+    else:
+        d_div = d_list[-1] if d_list else None
+    return {
+        "kind": "thread",
+        "id": thread_id,
+        "reason": "diverged",
+        "destination_tip": d_tip,
+        "source_tip": s_tip,
+        "common_ancestor": lca,
+        "destination_diverges_at": d_div,
+        "source_diverges_at": s_div,
+    }
+
+
+def _remap_part_payload(payload: str, fragment_map: dict[int, int]) -> str:
+    "Rewrite source fragment ids in a parts payload to this store's ids."
+    parsed = json.loads(payload)
+    refs = parsed.get("text_ref")
+    if refs:
+        for piece in refs:
+            old = piece.get("fragment")
+            if old is not None:
+                piece["fragment"] = fragment_map[old]
+    return json.dumps(parsed)
+
+
+# Identity-normalized provenance rows for a set of turns, as
+# (kind, identity, configuration) tuples. Tool/instance/fragment ids are
+# local integers, so comparisons go through their content identities.
+_TURN_CHILDREN_SQL = """
+select tt.turn_id as turn_id, 'tool' as kind,
+       t.hash as identity,
+       (ifnull(ti.name, '') || char(1) || ifnull(ti.plugin, '')
+        || char(1) || ifnull(ti.arguments, '')) as configuration
+from {schema}turn_tools tt
+join {schema}tools t on t.id = tt.tool_id
+left join {schema}tool_instances ti on ti.id = tt.instance_id
+where tt.turn_id in ({placeholders})
+union all
+select tf.turn_id, 'fragment', f.hash,
+       tf.kind || char(1) || tf."order"
+from {schema}turn_fragments tf
+join {schema}fragments f on f.id = tf.fragment_id
+where tf.turn_id in ({placeholders})
+union all
+select ti.turn_id, 'instantiation', ti.tool_call_id,
+       (ifnull(tiv.name, '') || char(1) || ifnull(tiv.plugin, '')
+        || char(1) || ifnull(tiv.arguments, ''))
+from {schema}tool_instantiations ti
+left join {schema}tool_instances tiv on tiv.id = ti.instance_id
+where ti.turn_id in ({placeholders})
+"""
+
+
+def _turn_child_keys(db, schema: str, turn_ids) -> dict[str, set]:
+    out: dict[str, set] = {turn_id: set() for turn_id in turn_ids}
+    if not turn_ids:
+        return out
+    for start in range(0, len(turn_ids), _VERIFY_CHUNK):
+        chunk = turn_ids[start : start + _VERIFY_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        sql = _TURN_CHILDREN_SQL.format(schema=schema, placeholders=placeholders)
+        for row in db.query(sql, chunk * 3):
+            out[row["turn_id"]].add(
+                (row["kind"], row["identity"], row["configuration"])
+            )
+    return out
 
 
 def ensure_attachment(db, attachment) -> str:

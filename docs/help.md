@@ -297,6 +297,7 @@ Options:
 Commands:
   list*   Show logged prompts and their responses
   backup  Backup your logs database to this file
+  merge   Merge another machine's logs database into this one.
   off     Turn off logging for all prompts
   on      Turn on logging for all prompts
   path    Output the path to the logs.db file
@@ -334,6 +335,25 @@ Usage: llm logs backup [OPTIONS] PATH
 
 Options:
   -h, --help  Show this message and exit.
+```
+
+(help-logs-merge)=
+#### llm logs merge --help
+```
+Usage: llm logs merge [OPTIONS] SOURCE
+
+  Merge another machine's logs database into this one.
+
+  Shared threads and messages are kept once, threads only one side has are both
+  retained, and a thread that has forked beyond resolution aborts the whole
+  merge instead of being half-merged. The command is idempotent: rerun it after
+  an interrupt or to sync new work.
+
+Options:
+  -d, --database FILE  Destination database (defaults to the local logs.db)
+  --dry-run            Report what the merge would do without writing anything
+  --json               Output the report as JSON
+  -h, --help           Show this message and exit.
 ```
 
 (help-logs-on)=

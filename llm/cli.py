@@ -66,6 +66,7 @@ from llm.models import ChainResponse, _BaseChainResponse, _BaseConversation
 
 from .logs import (
     LogStore,
+    MergeConflict,
     legacy_log_row_extras,
     log_row_extras,
     merged_log_rows,
@@ -1668,6 +1669,113 @@ def backup(path):
     except Exception as ex:  # noqa: BLE001
         raise click.ClickException(str(ex))
     click.echo(f"Backed up {_human_readable_size(path.stat().st_size)} to {path}")
+
+
+@logs.command(name="merge")
+@click.argument(
+    "source",
+    type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path),
+)
+@click.option(
+    "-d",
+    "--database",
+    type=click.Path(dir_okay=False, path_type=pathlib.Path),
+    help="Destination database (defaults to the local logs.db)",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Report what the merge would do without writing anything",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output the report as JSON")
+def logs_merge(source, database, dry_run, as_json):
+    """Merge another machine's logs database into this one.
+
+    Shared threads and messages are kept once, threads only one side has
+    are both retained, and a thread that has forked beyond resolution
+    aborts the whole merge instead of being half-merged. The command is
+    idempotent: rerun it after an interrupt or to sync new work.
+    """
+    destination = (database or pathlib.Path(logs_db_path())).resolve()
+    source = source.resolve()
+    if source == destination:
+        raise click.ClickException("Source and destination are the same database")
+
+    # Opening the source through LogStore applies any pending migrations,
+    # exactly as a normal run on that machine would.
+    source_db = _cli_database(source)
+    LogStore(source_db)
+
+    db = _cli_database(destination)
+    store = LogStore(db)
+    try:
+        report = store.merge(source, dry_run=dry_run)
+    except MergeConflict as ex:
+        if as_json:
+            click.echo(json.dumps({"ok": False, "conflicts": ex.conflicts}, indent=2))
+        else:
+            for conflict in ex.conflicts:
+                click.echo(_render_conflict(conflict), err=True)
+            click.echo(
+                f"Merge aborted with {len(ex.conflicts)} conflict(s): "
+                "no changes were made.",
+                err=True,
+            )
+        raise click.exceptions.Exit(1)
+    if as_json:
+        click.echo(json.dumps({"ok": True, "report": report.to_dict()}, indent=2))
+        return
+    click.echo(_render_merge_report(report))
+
+
+def _render_conflict(conflict: dict) -> str:
+    kind = conflict["kind"]
+    id = conflict.get("id")
+    reason = conflict.get("reason")
+    if kind == "thread" and reason == "diverged":
+        return (
+            f"Conflict: thread {id} has forked\n"
+            f"  common ancestor:   {conflict['common_ancestor']}\n"
+            f"  this machine:      {conflict['destination_diverges_at']}"
+            f" (tip {conflict['destination_tip']})\n"
+            f"  incoming database:{conflict['source_diverges_at']}"
+            f" (tip {conflict['source_tip']})"
+        )
+    if kind == "thread" and reason == "metadata":
+        return (
+            f"Conflict: thread {id} metadata disagrees "
+            f"({conflict['destination']} vs {conflict['source']})"
+        )
+    if kind == "turn":
+        return f"Conflict: turn {id} disagrees ({reason})"
+    if kind == "attachment":
+        return f"Conflict: attachment {id} media type disagrees"
+    return f"Conflict: {kind} {id} ({reason})"
+
+
+def _render_merge_report(report) -> str:
+    heading = "Dry run: would merge" if report.dry_run else "Merged"
+    lines = [
+        heading,
+        f"  threads added:      {len(report.threads_added)}",
+        f"  threads extended:   {len(report.threads_extended)}",
+        f"  threads unchanged:  {len(report.threads_unchanged)}",
+        f"  turns added:        {len(report.turns_added)}",
+        f"  turns unchanged:    {len(report.turns_unchanged)}",
+        f"  messages added:     {report.messages_added}",
+        f"  parts added:        {report.parts_added}",
+        f"  attachments added:  {report.attachments_added}",
+        f"  fragments added:    {report.fragments_added}",
+        f"  tools added:        {report.tools_added}",
+        f"  tool instances:     {report.tool_instances_added}",
+    ]
+    for entry in report.threads_extended:
+        lines.append(
+            f"    fast-forward {entry['id']}: {entry['old_tip']} -> {entry['new_tip']}"
+        )
+    for thread_id in report.threads_added:
+        lines.append(f"    added thread {thread_id}")
+    return "\n".join(lines)
 
 
 @logs.command(name="on")
