@@ -1,5 +1,12 @@
 # Changelog
 
+(v0_37)=
+## 0.37 (in development)
+
+New features:
+
+- Embeddings collections can now be re-indexed from one embedding model to another by model identity. Each embedding row records the model that produced it (new `model` column, backfilled for existing databases), and `Entry` objects returned by similarity searches expose that as `.model`. `Collection.embed()`, `embed_multi()` and `embed_multi_with_metadata()` accept a `model=` argument that only embeds rows that are missing, stale (produced by a different model generation) or whose content changed - rows already on the target model are never recomputed. Batches are committed atomically, so a failed or interrupted re-index run can be safely re-run and converges to a consistent state. Similarity searches stay scoped to the collection's current model generation while a re-index is in progress, keeping previous results valid, and the new `Collection.set_model()`, `stale_count()` and `model_counts()` methods manage and inspect the switch. Running `llm embed-multi` against an existing collection with a different `-m/--model` performs this re-index and switches the collection over automatically once every row has been updated. See {ref}`embeddings-switching-models`.
+
 (v0_36)=
 ## 0.36 (2026-09-22)
 

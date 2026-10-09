@@ -162,6 +162,21 @@ All three mechanisms support these options:
 
 The `--prepend` option is useful for embedding models that require you to prepend a special token to the content before embedding it. [nomic-embed-text-v2-moe](https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe) for example requires documents to be prepended `'search_document: '` and search queries to be prepended `'search_query: '`.
 
+(embeddings-cli-embed-multi-switching-models)=
+### Switching a collection to a different model
+
+Each stored embedding records the model that produced it, so running `llm embed-multi` against an existing collection with a **different** `-m/--model` re-indexes that collection onto the new model:
+
+```bash
+llm embed-multi docs --sql "SELECT id, body FROM posts" -m new-embedding-model --store
+```
+
+Only rows that are missing or still belong to the old model are embedded; rows already produced by the new model are left untouched. Each batch is committed separately, so if the command fails or is interrupted you can run it again and it will pick up where it left off without recomputing completed rows.
+
+Searches keep using the old model and its results while the re-index is in progress. Once every row is on the new model the collection is switched over automatically; if some rows could not be updated, a message on stderr tells you to re-run the command to finish.
+
+See {ref}`embeddings-switching-models` for the underlying Python API.
+
 (embeddings-cli-embed-multi-csv-etc)=
 ### Embedding data from a CSV, TSV or JSON file
 

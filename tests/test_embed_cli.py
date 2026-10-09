@@ -6,8 +6,64 @@ from unittest.mock import ANY
 import pytest
 from click.testing import CliRunner
 
+import llm
 from llm import Collection
 from llm.cli import cli
+from llm.plugins import pm
+
+
+class V2CliModel(llm.EmbeddingModel):
+    "Second embedding model generation, registered with the plugin manager"
+
+    model_id = "embed-v2-cli"
+    batch_size = 8
+
+    def __init__(self):
+        self.embedded = []
+
+    def embed_batch(self, texts):
+        for text in texts:
+            self.embedded.append(text)
+            yield [float(len(text))]
+
+
+class FlakyCliModel(llm.EmbeddingModel):
+    "Fails its first batch containing a chosen text, then succeeds"
+
+    model_id = "embed-flaky-cli"
+    batch_size = 2
+
+    def __init__(self):
+        self.failures_left = 1
+        self.embedded = []
+
+    def embed_batch(self, texts):
+        for text in texts:
+            if text == "gamma" and self.failures_left:
+                self.failures_left -= 1
+                raise RuntimeError("temporary embedding API failure")
+            self.embedded.append(text)
+            yield [float(len(text))]
+
+
+@pytest.fixture
+def extra_embedding_models():
+    v2_model = V2CliModel()
+    flaky_model = FlakyCliModel()
+
+    class ExtraModelsPlugin:
+        __name__ = "ExtraModelsPlugin"
+
+        @llm.hookimpl
+        def register_embedding_models(self, register):
+            register(v2_model)
+            register(flaky_model)
+
+    pm.register(ExtraModelsPlugin(), name="undo-extra-models-plugin")
+    try:
+        yield v2_model, flaky_model
+    finally:
+        pm.unregister(name="undo-extra-models-plugin")
 
 
 @pytest.mark.parametrize(
@@ -126,6 +182,7 @@ def test_embed_store(db_factory, user_path, metadata, metadata_error):
             "content_hash": Collection.content_hash("hello"),
             "metadata": expected_metadata,
             "updated": ANY,
+            "model": "embed-demo",
         }
     ]
     # Should show up in 'llm collections list'
@@ -171,6 +228,7 @@ def test_embed_store_binary(db_factory, user_path):
             "content_hash": b'\xb9_g\xf6\x1e\xbb\x03a\x96"\xd7\x98\xf4_\xc2\xd3',
             "metadata": None,
             "updated": ANY,
+            "model": "embed-demo",
         }
     ]
 
@@ -267,6 +325,7 @@ def test_similar_by_id_cli(user_path_with_embeddings):
         "score": pytest.approx(0.9863939238321437),
         "content": "goodbye world",
         "metadata": None,
+        "model": "embed-demo",
     }
 
 
@@ -305,12 +364,14 @@ def test_similar_by_content_cli(tmpdir, user_path_with_embeddings, scenario):
         "score": pytest.approx(0.9999999999999999),
         "content": "hello world",
         "metadata": None,
+        "model": "embed-demo",
     }
     assert json.loads(lines[1]) == {
         "id": "2",
         "score": pytest.approx(0.9863939238321437),
         "content": "goodbye world",
         "metadata": None,
+        "model": "embed-demo",
     }
 
 
@@ -324,6 +385,7 @@ def test_similar_by_content_cli(tmpdir, user_path_with_embeddings, scenario):
                 "score": pytest.approx(0.7071067811865475),
                 "content": "hello world",
                 "metadata": None,
+                "model": "embed-demo",
             },
         ),
         (
@@ -333,6 +395,7 @@ def test_similar_by_content_cli(tmpdir, user_path_with_embeddings, scenario):
                 "score": pytest.approx(0.8137334712067349),
                 "content": "goodbye world",
                 "metadata": None,
+                "model": "embed-demo",
             },
         ),
     ),
@@ -427,6 +490,7 @@ def test_embed_multi_files_binary_store(db_factory, tmpdir):
         "content_hash": b'\xb9_g\xf6\x1e\xbb\x03a\x96"\xd7\x98\xf4_\xc2\xd3',
         "metadata": None,
         "updated": ANY,
+        "model": "embed-demo",
     }
 
 
@@ -786,3 +850,125 @@ def test_duplicate_content_embedded_only_once(db_factory, embed_demo):
     # Should have only embedded one more thing
     assert db["embeddings"].count == 4
     assert len(embed_demo.embedded_content) == 4
+
+
+def _invoke_embed_multi(runner, db_path, model_id, csv_input):
+    return runner.invoke(
+        cli,
+        ["embed-multi", "docs", "-d", db_path, "-m", model_id, "-"],
+        input=csv_input,
+    )
+
+
+def test_cli_embed_multi_rotates_to_new_model(
+    db_factory, tmpdir, extra_embedding_models
+):
+    v2_model, _ = extra_embedding_models
+    db_path = str(tmpdir / "embeddings.db")
+    runner = CliRunner()
+
+    result = _invoke_embed_multi(
+        runner, db_path, "embed-demo", "id,content\n1,alpha\n2,beta\n"
+    )
+    assert result.exit_code == 0
+    db = db_factory(db_path)
+    assert next(db["collections"].rows)["model"] == "embed-demo"
+
+    # Rotate the existing collection onto the new model
+    result = _invoke_embed_multi(
+        runner, db_path, "embed-v2-cli", "id,content\n1,alpha\n2,beta\n"
+    )
+    assert result.exit_code == 0
+    assert (
+        "Switched collection 'docs' to embedding model 'embed-v2-cli'." in result.output
+    )
+    assert db["embeddings"].count == 2
+    assert {row["model"] for row in db["embeddings"].rows} == {"embed-v2-cli"}
+    assert next(db["collections"].rows)["model"] == "embed-v2-cli"
+    assert sorted(v2_model.embedded) == ["alpha", "beta"]
+
+    # Re-running the same rotation must not recompute anything
+    result = _invoke_embed_multi(
+        runner, db_path, "embed-v2-cli", "id,content\n1,alpha\n2,beta\n"
+    )
+    assert result.exit_code == 0
+    assert sorted(v2_model.embedded) == ["alpha", "beta"]
+    assert "Switched collection" not in result.output
+
+
+def test_cli_embed_multi_rotation_partial_keeps_old_model(
+    db_factory, tmpdir, extra_embedding_models
+):
+    db_path = str(tmpdir / "embeddings.db")
+    runner = CliRunner()
+    # Full corpus under the old model
+    assert (
+        _invoke_embed_multi(
+            runner,
+            db_path,
+            "embed-demo",
+            "id,content\n1,alpha\n2,beta\n3,gamma\n",
+        ).exit_code
+        == 0
+    )
+    db = db_factory(db_path)
+
+    # Rotation run that only supplies some rows must not switch the
+    # collection, since stale rows would otherwise disappear from search
+    result = _invoke_embed_multi(
+        runner, db_path, "embed-v2-cli", "id,content\n1,alpha\n"
+    )
+    assert result.exit_code == 0
+    assert "still in progress" in result.output
+    assert next(db["collections"].rows)["model"] == "embed-demo"
+
+    # Completing the corpus switches the collection
+    result = _invoke_embed_multi(
+        runner,
+        db_path,
+        "embed-v2-cli",
+        "id,content\n1,alpha\n2,beta\n3,gamma\n",
+    )
+    assert result.exit_code == 0
+    assert "Switched collection 'docs'" in result.output
+    assert next(db["collections"].rows)["model"] == "embed-v2-cli"
+    assert {row["model"] for row in db["embeddings"].rows} == {"embed-v2-cli"}
+
+
+def test_cli_embed_multi_rotation_resumes_after_failure(
+    db_factory, tmpdir, extra_embedding_models
+):
+    _, flaky_model = extra_embedding_models
+    db_path = str(tmpdir / "embeddings.db")
+    runner = CliRunner()
+    csv_input = "id,content\n1,alpha\n2,beta\n3,gamma\n4,delta\n"
+    assert _invoke_embed_multi(runner, db_path, "embed-demo", csv_input).exit_code == 0
+    db = db_factory(db_path)
+
+    # First rotation attempt: batch [alpha, beta] commits (batch_size=2),
+    # then the API fails on gamma
+    result = _invoke_embed_multi(runner, db_path, "embed-flaky-cli", csv_input)
+    assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert "temporary embedding API failure" in str(result.exception)
+    assert next(db["collections"].rows)["model"] == "embed-demo"
+    counts = {
+        row["model"]: row["c"]
+        for row in db.query(
+            "select model, count(*) as c from embeddings group by model"
+        )
+    }
+    assert counts == {"embed-flaky-cli": 2, "embed-demo": 2}
+
+    # Re-run after the API recovered: done batches are skipped and the
+    # remaining rows converge, then the collection flips to the new model
+    result = _invoke_embed_multi(runner, db_path, "embed-flaky-cli", csv_input)
+    assert result.exit_code == 0
+    assert "Switched collection 'docs' to embedding model 'embed-flaky-cli'." in (
+        result.output
+    )
+    assert db["embeddings"].count == 4
+    assert {row["model"] for row in db["embeddings"].rows} == {"embed-flaky-cli"}
+    assert next(db["collections"].rows)["model"] == "embed-flaky-cli"
+    # Every text was embedded exactly once across both runs
+    assert sorted(flaky_model.embedded) == ["alpha", "beta", "delta", "gamma"]

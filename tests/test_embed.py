@@ -5,6 +5,42 @@ import pytest
 
 import llm
 from llm.embeddings import Entry
+from llm.embeddings_migrations import embeddings_migrations
+
+
+class NewGenerationModel(llm.EmbeddingModel):
+    "Stand-in for a new embedding model generation (does not need registering)"
+
+    model_id = "embed-v2"
+    batch_size = 2
+
+    def __init__(self):
+        self.embedded = []
+        self.batch_count = 0
+
+    def embed_batch(self, texts):
+        self.batch_count += 1
+        for text in texts:
+            self.embedded.append(text)
+            yield [float(len(text))]
+
+
+class FlakyNewGenerationModel(llm.EmbeddingModel):
+    "Same model identity as NewGenerationModel, but can fail on chosen texts"
+
+    model_id = "embed-v2"
+    batch_size = 2
+
+    def __init__(self, fail_on=()):
+        self.fail_on = set(fail_on)
+        self.embedded = []
+
+    def embed_batch(self, texts):
+        for text in texts:
+            if text in self.fail_on:
+                raise RuntimeError("temporary embedding API failure")
+            self.embedded.append(text)
+            yield [float(len(text))]
 
 
 def test_demo_plugin():
@@ -117,6 +153,7 @@ def test_collection(collection):
             "collection_id": 1,
             "id": "1",
             "embedding": llm.encode([5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            "model": "embed-demo",
             "content": None,
             "content_blob": None,
             "content_hash": collection.content_hash("hello world"),
@@ -127,6 +164,7 @@ def test_collection(collection):
             "collection_id": 1,
             "id": "2",
             "embedding": llm.encode([7, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            "model": "embed-demo",
             "content": None,
             "content_blob": None,
             "content_hash": collection.content_hash("goodbye world"),
@@ -140,22 +178,38 @@ def test_collection(collection):
 def test_similar(collection):
     results = list(collection.similar("hello world"))
     assert results == [
-        Entry(id="1", score=pytest.approx(0.9999999999999999)),
-        Entry(id="2", score=pytest.approx(0.9863939238321437)),
+        Entry(
+            id="1",
+            score=pytest.approx(0.9999999999999999),
+            model="embed-demo",
+        ),
+        Entry(
+            id="2",
+            score=pytest.approx(0.9863939238321437),
+            model="embed-demo",
+        ),
     ]
 
 
 def test_similar_prefixed(collection):
     results = list(collection.similar("hello world", prefix="2"))
     assert results == [
-        Entry(id="2", score=pytest.approx(0.9863939238321437)),
+        Entry(
+            id="2",
+            score=pytest.approx(0.9863939238321437),
+            model="embed-demo",
+        ),
     ]
 
 
 def test_similar_by_id(collection):
     results = list(collection.similar_by_id("1"))
     assert results == [
-        Entry(id="2", score=pytest.approx(0.9863939238321437)),
+        Entry(
+            id="2",
+            score=pytest.approx(0.9863939238321437),
+            model="embed-demo",
+        ),
     ]
 
 
@@ -237,3 +291,192 @@ def test_binary_only_and_text_only_embedding_models():
         list(text_only.embed_multi([b"hello world"]))
 
     list(text_only.embed_multi(["hello world"]))
+
+
+def test_embeddings_migration_backfills_model(db_factory):
+    # A database frozen at the pre-m006 schema
+    db = db_factory(memory=True)
+    embeddings_migrations.apply(db, stop_before="m006_add_embeddings_model")
+    db.execute("insert into collections (id, name, model) values (1, 'old', 'old-gen')")
+    db.execute(
+        "insert into embeddings (collection_id, id, embedding) values (1, 'a', x'00')"
+    )
+    assert "model" not in db["embeddings"].columns_dict
+
+    embeddings_migrations.apply(db)
+
+    row = next(db["embeddings"].rows)
+    # Existing rows inherit their collection's model generation
+    assert row["model"] == "old-gen"
+    # The foreign key survived the table rebuild
+    assert any(
+        fk.column == "collection_id"
+        and fk.other_table == "collections"
+        and fk.other_column == "id"
+        for fk in db["embeddings"].foreign_keys
+    )
+
+
+def test_rows_tagged_with_model_generation(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed_multi([("1", "alpha"), ("2", "beta")])
+    assert collection.model_counts() == {"embed-demo": 2}
+    assert collection.stale_count() == 0
+    assert {row["model"] for row in db["embeddings"].rows} == {"embed-demo"}
+
+
+def test_embed_single_row_rotates_by_model_identity(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world")
+
+    # A different model generation means the row is stale and must be redone
+    v2 = NewGenerationModel()
+    collection.embed("1", "hello world", model=v2)
+    assert v2.embedded == ["hello world"]
+    assert collection.model_counts() == {"embed-v2": 1}
+    # Replaced in place - no duplicate row
+    assert db["embeddings"].count == 1
+
+    # Same generation + unchanged content: not recomputed
+    v2_again = NewGenerationModel()
+    collection.embed("1", "hello world", model=v2_again)
+    assert v2_again.embedded == []
+
+    # Changed content with the same model: recomputed
+    v2_changed = NewGenerationModel()
+    collection.embed("1", "hello changed world", model=v2_changed)
+    assert v2_changed.embedded == ["hello changed world"]
+
+
+def test_embed_multi_rotation_only_replaces_stale_rows(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    entries = [("1", "alpha"), ("2", "beta"), ("3", "gamma")]
+    collection.embed_multi(entries, store=True)
+
+    new_model = NewGenerationModel()
+    collection.embed_multi(entries, model=new_model)
+
+    # All rows replaced in place with the new generation
+    assert db["embeddings"].count == 3
+    assert collection.model_counts() == {"embed-v2": 3}
+    assert sorted(row["id"] for row in db["embeddings"].rows) == ["1", "2", "3"]
+    assert sorted(new_model.embedded) == ["alpha", "beta", "gamma"]
+    assert collection.stale_count(new_model) == 0
+
+    # Re-running with a fresh instance (a new process, same model identity)
+    # recomputes nothing
+    rerun_model = NewGenerationModel()
+    collection.embed_multi(entries, model=rerun_model)
+    assert rerun_model.embedded == []
+    assert rerun_model.batch_count == 0
+    assert collection.model_counts() == {"embed-v2": 3}
+
+
+def test_embed_multi_rotation_fills_mixed_state(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed_multi([("1", "alpha"), ("2", "beta"), ("3", "gamma")], store=True)
+    # Simulate an interrupted previous run: row 1 already migrated, row 3 gone
+    collection.embed("1", "alpha", model=NewGenerationModel())
+    db.execute("delete from embeddings where collection_id = ? and id = ?", [1, "3"])
+    assert collection.model_counts() == {"embed-v2": 1, "embed-demo": 1}
+
+    new_model = NewGenerationModel()
+    collection.embed_multi(
+        [("1", "alpha"), ("2", "beta"), ("3", "gamma")], model=new_model
+    )
+
+    # Only the stale row (2) and missing row (3) were computed
+    assert sorted(new_model.embedded) == ["beta", "gamma"]
+    assert db["embeddings"].count == 3
+    assert collection.model_counts() == {"embed-v2": 3}
+
+
+def test_embed_multi_rotation_resumes_after_batch_failure(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    entries = [("1", "alpha"), ("2", "beta"), ("3", "gamma")]
+    collection.embed_multi(entries, store=True)
+
+    # First attempt dies while embedding the second batch (batch_size = 2)
+    flaky = FlakyNewGenerationModel(fail_on={"gamma"})
+    with pytest.raises(RuntimeError, match="temporary embedding API failure"):
+        collection.embed_multi(entries, model=flaky, store=True)
+
+    # Batch 1 was committed atomically; the failed batch left no half-row,
+    # and the collection has NOT switched models
+    assert db["embeddings"].count == 3
+    assert collection.model_counts() == {"embed-v2": 2, "embed-demo": 1}
+    assert collection.model_id == "embed-demo"
+
+    # Old results remain usable throughout: default search stays in the old
+    # generation, and every result says which generation it came from
+    old_results = collection.similar("alpha")
+    assert [(e.id, e.model) for e in old_results] == [("3", "embed-demo")]
+
+    # New-generation rows are inspectable via an explicit generation scope
+    new_results = collection.similar_by_vector([5.0], model="embed-v2")
+    assert sorted(e.id for e in new_results) == ["1", "2"]
+    assert {e.model for e in new_results} == {"embed-v2"}
+
+    # Re-run with the same model identity now healthy: completed rows are
+    # skipped and the run converges without duplicates or recomputation
+    recovered = FlakyNewGenerationModel()
+    collection.embed_multi(entries, model=recovered, store=True)
+    assert recovered.embedded == ["gamma"]
+    assert db["embeddings"].count == 3
+    assert collection.model_counts() == {"embed-v2": 3}
+    assert collection.stale_count(recovered) == 0
+
+    collection.set_model(recovered)
+    assert collection.model_id == "embed-v2"
+    # Search defaults to the new generation once the switch is complete
+    assert sorted(e.id for e in collection.similar("gamma")) == ["1", "2", "3"]
+
+
+def test_similar_scoped_to_generation_during_rotation(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed_multi([("1", "alpha"), ("2", "beta"), ("3", "gamma")], store=True)
+    v2 = NewGenerationModel()
+    collection.embed_multi([("1", "alpha"), ("2", "beta")], model=v2)
+    assert collection.model_id == "embed-demo"
+
+    # While mixed, default search only sees the collection's generation
+    results = collection.similar("alpha")
+    assert [(e.id, e.model) for e in results] == [("3", "embed-demo")]
+
+    # similar_by_id follows whatever generation the pivot row belongs to
+    assert sorted(e.id for e in collection.similar_by_id("1")) == ["2"]
+    assert all(e.model == "embed-v2" for e in collection.similar_by_id("1"))
+    # Row 3 is alone in the old generation (and excludes itself)
+    assert collection.similar_by_id("3") == []
+
+    # Flipping with a row still stale keeps that row out of default search
+    collection.set_model(v2)
+    assert sorted(e.id for e in collection.similar("gamma")) == ["1", "2"]
+    # Finish the last stale row and everything is consistent again
+    collection.embed("3", "gamma", model=v2)
+    assert sorted(e.id for e in collection.similar("gamma")) == ["1", "2", "3"]
+
+
+def test_stale_count_and_set_model(db_factory):
+    db = db_factory(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed_multi([("1", "alpha"), ("2", "beta")])
+    v2 = NewGenerationModel()
+
+    assert collection.stale_count(v2) == 2
+    collection.set_model(v2)
+    # set_model only flips the pointer; rows are untouched
+    assert collection.model_id == "embed-v2"
+    assert collection.model().model_id == "embed-v2"
+    assert next(db["collections"].rows)["model"] == "embed-v2"
+    assert collection.model_counts() == {"embed-demo": 2}
+    assert collection.stale_count() == 2
+    # Setting the same model again is a no-op
+    collection.set_model(v2)
+    assert collection.model_id == "embed-v2"

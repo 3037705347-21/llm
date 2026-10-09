@@ -134,12 +134,15 @@ A collection instance has the following properties and methods:
 - `model_id` - the string ID of the embedding model used for this collection
 - `model()` - returns the `EmbeddingModel` instance, based on that `model_id`
 - `count()` - returns the integer number of items in the collection
-- `embed(id: str, value: str | bytes, metadata: dict[str, Any] | None = None, store: bool = False, *, key: str | None = None)` - embeds the given value and stores it in the collection under the given ID. Can optionally include metadata (stored as JSON), store the text or binary content itself in the database table and pass an API key or stored key alias.
-- `embed_multi(entries: Iterable[tuple[str, str | bytes]], store: bool = False, batch_size: int = 100, *, key: str | None = None)` - see above
-- `embed_multi_with_metadata(entries: Iterable[tuple[str, str | bytes, dict[str, Any] | None]], store: bool = False, batch_size: int = 100, *, key: str | None = None)` - see above
-- `similar(value: str | bytes, number: int = 10, prefix: str | None = None)` - returns a list of entries that are most similar to the embedding of the given value
-- `similar_by_id(id: str, number: int = 10, prefix: str | None = None)` - returns a list of entries that are most similar to the embedding of the item with the given ID
-- `similar_by_vector(vector: list[float], number: int = 10, skip_id: str | None = None, prefix: str | None = None)` - returns a list of entries that are most similar to the given embedding vector, optionally skipping the entry with the given ID
+- `embed(id: str, value: str | bytes, metadata: dict[str, Any] | None = None, store: bool = False, *, key: str | None = None, model: EmbeddingModel | str | None = None)` - embeds the given value and stores it in the collection under the given ID. Can optionally include metadata (stored as JSON), store the text or binary content itself in the database table, pass an API key or stored key alias, or embed using a different `model` generation (see {ref}`embeddings-switching-models`).
+- `embed_multi(entries: Iterable[tuple[str, str | bytes]], store: bool = False, batch_size: int = 100, *, key: str | None = None, model: EmbeddingModel | str | None = None)` - see above
+- `embed_multi_with_metadata(entries: Iterable[tuple[str, str | bytes, dict[str, Any] | None]], store: bool = False, batch_size: int = 100, *, key: str | None = None, model: EmbeddingModel | str | None = None)` - see above
+- `similar(value: str | bytes, number: int = 10, prefix: str | None = None, *, model: EmbeddingModel | str | None = None)` - returns a list of entries that are most similar to the embedding of the given value, searched within one model generation
+- `similar_by_id(id: str, number: int = 10, prefix: str | None = None)` - returns a list of entries that are most similar to the embedding of the item with the given ID; automatically uses the same model generation as that item
+- `similar_by_vector(vector: list[float], number: int = 10, skip_id: str | None = None, prefix: str | None = None, *, model: str | None = None)` - returns a list of entries that are most similar to the given embedding vector, optionally skipping the entry with the given ID and restricting the search to one model generation
+- `set_model(model: EmbeddingModel | str)` - switch the collection's configured model generation without embedding or deleting anything
+- `stale_count(model: EmbeddingModel | str | None = None)` - number of rows not embedded by the given model (defaults to the collection's current model)
+- `model_counts()` - dictionary mapping model ID to the number of embeddings currently stored from that model
 - `delete()` - deletes the collection and its embeddings from the database
 
 There is also a `Collection.exists(db, name)` class method which returns a boolean value and can be used to determine if a collection exists or not in a database:
@@ -168,6 +171,7 @@ The `entry` object returned is an object with the following properties:
 - `score` - the floating point similarity score between the item and the query string
 - `content` - the string text content of the item, if it was stored - or `None`
 - `metadata` - the dictionary (from JSON) metadata for the item, if it was stored - or `None`
+- `model` - the ID of the embedding model that produced this entry's vector, identifying which model generation it belongs to - or `None`
 
 This defaults to returning the 10 most similar items. You can change this by passing a different `number=` argument:
 ```python
@@ -181,6 +185,34 @@ for entry in collection.similar_by_id("cat"):
     print(entry.id, entry.score)
 ```
 The item itself is excluded from the results.
+
+(embeddings-switching-models)=
+## Switching a collection to a new embedding model
+
+Embedding vectors from different models live in incompatible spaces, so when you retire an old embedding model every row needs to be re-embedded by the new one. Rather than doing this all at once (and risking a half-finished collection if the process is interrupted), collections can be **re-indexed by model identity**:
+
+- Every stored row records which model produced it, in the `model` column. Each `Entry` returned by `similar()` and friends exposes this as `entry.model`.
+- Calling `embed_multi()` (or `embed()`) with `model=` different from the collection's model only embeds rows that are **missing** or that belong to an **older generation** (or whose content changed). Rows already produced by the target model are skipped, so re-running the same command is safe and does no extra work.
+- Stale rows are replaced in place, one batch per database transaction. If a batch fails or the process is killed, already-completed batches persist; re-running resumes from the first unfinished batch and the collection converges to the same state.
+- Until the re-index completes, the collection keeps its old configured model and similarity searches stay scoped to that generation, so old results remain valid throughout. Rows from the new generation can be inspected explicitly with `similar(..., model=new_model)`.
+- Once `stale_count(new_model)` is zero, flip the collection over with `set_model(new_model)`.
+
+```python
+new_model = llm.get_embedding_model("new-embedding-model")
+# Run this as many times as needed - it resumes where it left off
+collection.embed_multi(iter_all_entries(), model=new_model)
+if collection.stale_count(new_model) == 0:
+    collection.set_model(new_model)
+```
+
+`model_counts()` shows how the rows are split between generations while a re-index is in flight:
+
+```python
+collection.model_counts()
+# {'old-embedding-model': 8124, 'new-embedding-model': 3021}
+```
+
+On the command line, re-indexing is triggered by running `llm embed-multi` against an existing collection with a different `-m/--model`; the collection is switched automatically once every row is on the new model, and a message tells you to re-run if rows still remain on the old model.
 
 (embeddings-sql-schema)=
 ## SQL schema
@@ -212,6 +244,7 @@ CREATE TABLE "embeddings" (
    "collection_id" INTEGER REFERENCES "collections"("id"),
    "id" TEXT,
    "embedding" BLOB,
+   "model" TEXT,
    "content" TEXT,
    "content_blob" BLOB,
    "content_hash" BLOB,

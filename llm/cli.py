@@ -3580,6 +3580,11 @@ def embed_multi(
          llm embed-multi docs --files docs '**/*.md'
          llm embed-multi images --files photos '*.jpg' --binary
          llm embed-multi texts --files texts '*.txt' --encoding utf-8 --encoding latin-1
+
+    Running this against an existing collection with a different -m/--model
+    re-indexes it onto that model: only missing or old-model rows are
+    embedded, and the command can be safely re-run to resume an interrupted
+    batch. The collection switches models once every row is up to date.
     """
     if binary and not files:
         raise click.UsageError("--binary must be used with --files")
@@ -3600,14 +3605,23 @@ def embed_multi(
         db.attach(alias, attach_path)
 
     model_id = model or get_default_embedding_model()
+    collection_existed = Collection.exists(db, collection)
+    target_model = None
     try:
         collection_obj = Collection(
             collection, db=db, model_id=model_id, create=model_id is not None
         )
+        # For an existing collection, resolve the requested model so an
+        # alias can be compared against the collection's current model
+        if collection_existed and model_id is not None:
+            target_model = get_embedding_model(model_id)
     except (Collection.DoesNotExist, UnknownModelError):
         raise click.ClickException(
             "You need to specify an embedding model (no default model is set)"
         )
+    rotating = bool(
+        target_model is not None and target_model.model_id != collection_obj.model_id
+    )
 
     expected_length = None
     if files:
@@ -3699,7 +3713,33 @@ def embed_multi(
         embed_kwargs = {"store": store, "key": key}
         if batch_size:
             embed_kwargs["batch_size"] = batch_size
-        collection_obj.embed_multi(tuples(), **embed_kwargs)
+        if rotating:
+            # Re-index onto a new model generation: rows already embedded
+            # by the target model are skipped, so failed or interrupted
+            # batches can safely be finished by re-running this command
+            collection_obj.embed_multi(tuples(), model=target_model, **embed_kwargs)
+        else:
+            collection_obj.embed_multi(tuples(), **embed_kwargs)
+
+    if rotating:
+        stale = collection_obj.stale_count(target_model)
+        if stale:
+            click.echo(
+                f"Re-indexing to '{target_model.model_id}' is still in "
+                f"progress: {stale} embedding{'' if stale == 1 else 's'} "
+                f"belong to the previous model. Re-run this command to "
+                f"continue - the collection keeps using "
+                f"'{collection_obj.model_id}' until every row has been "
+                f"embedded by the new model.",
+                err=True,
+            )
+        else:
+            collection_obj.set_model(target_model)
+            click.echo(
+                f"Switched collection '{collection}' to embedding model "
+                f"'{target_model.model_id}'.",
+                err=True,
+            )
 
 
 @cli.command()

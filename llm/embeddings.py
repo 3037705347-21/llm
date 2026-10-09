@@ -19,6 +19,7 @@ class Entry:
     score: float | None
     content: str | None = None
     metadata: dict[str, Any] | None = None
+    model: str | None = None
 
 
 class Collection:
@@ -75,6 +76,7 @@ class Collection:
                     model = llm.get_embedding_model(model_id)
                     self._model = model
                 model_id = cast(EmbeddingModel, model).model_id
+                self.model_id = model_id
                 self.id = (
                     cast(Table, self.db["collections"])
                     .insert(
@@ -96,6 +98,21 @@ class Collection:
             self._model = llm.get_embedding_model(self.model_id)
 
         return cast(EmbeddingModel, self._model)
+
+    def _resolve_model(self, model: EmbeddingModel | str | None) -> EmbeddingModel:
+        """
+        Resolve an embedding model argument to an EmbeddingModel instance.
+
+        None means the collection's configured model; a string is treated as
+        a model ID or alias and resolved through the plugin registry.
+        """
+        if model is None:
+            return self.model()
+        if isinstance(model, EmbeddingModel):
+            return model
+        import llm
+
+        return llm.get_embedding_model(model)
 
     def count(self) -> int:
         """
@@ -123,6 +140,7 @@ class Collection:
         store: bool = False,
         *,
         key: str | None = None,
+        model: EmbeddingModel | str | None = None,
     ) -> None:
         """
         Embed value and store it in the collection with a given ID.
@@ -133,20 +151,30 @@ class Collection:
             metadata (dict, optional): Metadata to be stored
             store (bool, optional): Whether to store the value in the content or content_blob column
             key (str, optional): API key or stored key alias to use
+            model (EmbeddingModel or str, optional): Model to embed with,
+                overriding the collection's configured model. The stored row
+                is tagged with that model's ID. Pass a different model to
+                re-index just this ID for a new generation.
         """
         from llm import encode
 
+        embedding_model = self._resolve_model(model)
+        model_id = embedding_model.model_id
         content_hash = self.content_hash(value)
+        # Only skip if this exact content has already been embedded by this
+        # same model generation - a different model means the row is stale.
         if self.db["embeddings"].count_where(
-            "content_hash = ? and collection_id = ?", [content_hash, self.id]
+            "content_hash = ? and collection_id = ? and model = ?",
+            [content_hash, self.id, model_id],
         ):
             return
-        embedding = self.model().embed(value, key=key)
+        embedding = embedding_model.embed(value, key=key)
         cast(Table, self.db["embeddings"]).insert(
             {
                 "collection_id": self.id,
                 "id": id,
                 "embedding": encode(embedding),
+                "model": model_id,
                 "content": value if (store and isinstance(value, str)) else None,
                 "content_blob": value if (store and isinstance(value, bytes)) else None,
                 "content_hash": content_hash,
@@ -163,6 +191,7 @@ class Collection:
         batch_size: int = 100,
         *,
         key: str | None = None,
+        model: EmbeddingModel | str | None = None,
     ) -> None:
         """
         Embed multiple texts and store them in the collection with given IDs.
@@ -172,12 +201,17 @@ class Collection:
             store (bool, optional): Whether to store the text in the content column
             batch_size (int, optional): custom maximum batch size to use
             key (str, optional): API key or stored key alias to use
+            model (EmbeddingModel or str, optional): Model to embed with,
+                overriding the collection's configured model. Rows already
+                embedded by that model (with unchanged content) are skipped;
+                rows from other model generations are replaced in place.
         """
         self.embed_multi_with_metadata(
             ((id, value, None) for id, value in entries),
             store=store,
             batch_size=batch_size,
             key=key,
+            model=model,
         )
 
     def embed_multi_with_metadata(
@@ -187,6 +221,7 @@ class Collection:
         batch_size: int = 100,
         *,
         key: str | None = None,
+        model: EmbeddingModel | str | None = None,
     ) -> None:
         """
         Embed multiple values along with metadata and store them in the collection with given IDs.
@@ -196,10 +231,18 @@ class Collection:
             store (bool, optional): Whether to store the value in the content or content_blob column
             batch_size (int, optional): custom maximum batch size to use
             key (str, optional): API key or stored key alias to use
+            model (EmbeddingModel or str, optional): Model to embed with,
+                overriding the collection's configured model. Only rows that
+                are missing, or were produced by a different model
+                generation (or have changed content), are embedded; every
+                batch is committed atomically, so an interrupted or failed
+                run can safely be re-run and will converge.
         """
         import llm
 
-        batch_size = min(batch_size, (self.model().batch_size or batch_size))
+        embedding_model = self._resolve_model(model)
+        model_id = embedding_model.model_id
+        batch_size = min(batch_size, (embedding_model.batch_size or batch_size))
         iterator = iter(entries)
         collection_id = self.id
         while True:
@@ -208,22 +251,28 @@ class Collection:
                 break
             # Calculate hashes first
             items_and_hashes = [(item, self.content_hash(item[1])) for item in batch]
-            # Any of those hashes already exist?
+            # Skip IDs whose content is already embedded by this same model
             existing_ids = [
                 row["id"]
                 for row in self.db.query(
                     """
                     select id from embeddings
-                    where collection_id = ? and content_hash in ({})
+                    where collection_id = ? and model = ? and content_hash in ({})
                     """.format(",".join("?" for _ in items_and_hashes)),
-                    [collection_id]
+                    [collection_id, model_id]
                     + [item_and_hash[1] for item_and_hash in items_and_hashes],
                 )
             ]
             filtered_batch = [item for item in batch if item[0] not in existing_ids]
+            if not filtered_batch:
+                continue
             embeddings = list(
-                self.model().embed_multi((item[1] for item in filtered_batch), key=key)
+                embedding_model.embed_multi(
+                    (item[1] for item in filtered_batch), key=key
+                )
             )
+            # Replace the stale/missing rows in one atomic batch, so a crash
+            # can never leave a row half-written and completed work persists
             with self.db.atomic():
                 cast(Table, self.db["embeddings"]).insert_all(
                     (
@@ -231,6 +280,7 @@ class Collection:
                             "collection_id": collection_id,
                             "id": id,
                             "embedding": llm.encode(embedding),
+                            "model": model_id,
                             "content": (
                                 value if (store and isinstance(value, str)) else None
                             ),
@@ -254,20 +304,31 @@ class Collection:
         number: int = 10,
         skip_id: str | None = None,
         prefix: str | None = None,
+        *,
+        model: str | None = None,
     ) -> list[Entry]:
         """
         Find similar items in the collection by a given vector.
 
+        Only embeddings belonging to one model generation are searched, so
+        vectors produced by incompatible models are never compared. By
+        default that is the collection's configured model - meaning old
+        results stay valid while a re-index to a new model is in progress.
+
         Args:
-            vector (list): Vector to search by
+            vector (list): Vector to search by (must come from ``model``)
             number (int, optional): Number of similar items to return
             skip_id (str, optional): An ID to exclude from the results
             prefix: (str, optional): Filter results to IDs witih this prefix
+            model (str, optional): Model generation to search; defaults to
+                the collection's configured model
 
         Returns:
-            list: List of Entry objects
+            list: List of Entry objects (each tagged with its ``.model``)
         """
         import llm
+
+        scope_model = self.model_id if model is None else model
 
         def distance_score(other_encoded):
             other_vector = llm.decode(other_encoded)
@@ -275,8 +336,8 @@ class Collection:
 
         self.db.register_function(distance_score, replace=True)
 
-        where_bits = ["collection_id = ?"]
-        where_args = [str(self.id)]
+        where_bits = ["collection_id = ?", "model = ?"]
+        where_args: list[Any] = [str(self.id), scope_model]
 
         if prefix:
             where_bits.append("id LIKE ? || '%'")
@@ -292,10 +353,11 @@ class Collection:
                 score=row["score"],
                 content=row["content"],
                 metadata=json.loads(row["metadata"]) if row["metadata"] else None,
+                model=row["model"],
             )
             for row in self.db.query(
                 """
-            select id, content, metadata, distance_score(embedding) as score
+            select id, content, metadata, model, distance_score(embedding) as score
             from embeddings
             where {where}
             order by score desc limit {number}
@@ -312,6 +374,9 @@ class Collection:
     ) -> list[Entry]:
         """
         Find similar items in the collection by a given ID.
+
+        The search is scoped to whatever model generation the pivot ID
+        belongs to, so comparisons always stay within one vector space.
 
         Args:
             id (str): ID to search by
@@ -330,14 +395,23 @@ class Collection:
         )
         if not matches:
             raise self.DoesNotExist("ID not found")
-        embedding = matches[0]["embedding"]
-        comparison_vector = llm.decode(embedding)
+        pivot = matches[0]
+        comparison_vector = llm.decode(pivot["embedding"])
         return self.similar_by_vector(
-            comparison_vector, number, skip_id=id, prefix=prefix
+            comparison_vector,
+            number,
+            skip_id=id,
+            prefix=prefix,
+            model=pivot["model"],
         )
 
     def similar(
-        self, value: str | bytes, number: int = 10, prefix: str | None = None
+        self,
+        value: str | bytes,
+        number: int = 10,
+        prefix: str | None = None,
+        *,
+        model: EmbeddingModel | str | None = None,
     ) -> list[Entry]:
         """
         Find similar items in the collection by a given value.
@@ -346,12 +420,18 @@ class Collection:
             value (str or bytes): value to search by
             number (int, optional): Number of similar items to return
             prefix: (str, optional): Filter results to IDs with this prefix
+            model (EmbeddingModel or str, optional): Model generation to
+                embed the query with and search; defaults to the
+                collection's configured model
 
         Returns:
             list: List of Entry objects
         """
-        comparison_vector = self.model().embed(value)
-        return self.similar_by_vector(comparison_vector, number, prefix=prefix)
+        embedding_model = self._resolve_model(model)
+        comparison_vector = embedding_model.embed(value)
+        return self.similar_by_vector(
+            comparison_vector, number, prefix=prefix, model=embedding_model.model_id
+        )
 
     @classmethod
     def exists(cls, db: Database, name: str) -> bool:
@@ -371,6 +451,70 @@ class Collection:
         with self.db.atomic():
             self.db.execute("delete from embeddings where collection_id = ?", [self.id])
             self.db.execute("delete from collections where id = ?", [self.id])
+
+    def set_model(self, model: EmbeddingModel | str) -> None:
+        """
+        Switch the collection's configured model generation.
+
+        This only updates which model the collection treats as current - it
+        does not embed or delete anything. It is normally called once a
+        re-index run has brought every row onto the new model.
+
+        Args:
+            model (EmbeddingModel or str): The new current model
+        """
+        embedding_model = self._resolve_model(model)
+        if embedding_model.model_id != self.model_id:
+            cast(Table, self.db["collections"]).update(
+                self.id, {"model": embedding_model.model_id}
+            )
+            self.model_id = embedding_model.model_id
+        self._model = embedding_model
+
+    def stale_count(self, model: EmbeddingModel | str | None = None) -> int:
+        """
+        Count rows not yet embedded by the given model.
+
+        A row counts as stale when its recorded model generation differs
+        from ``model`` (which defaults to the collection's current model).
+        Zero means the collection is consistent for that generation.
+
+        Args:
+            model (EmbeddingModel or str, optional): Target model; defaults
+                to the collection's configured model
+
+        Returns:
+            int: Number of embeddings belonging to other model generations
+        """
+        target_model_id = self._resolve_model(model).model_id
+        return next(
+            self.db.query(
+                """
+            select count(*) as c from embeddings
+            where collection_id = ? and coalesce(model, '') != ?
+            """,
+                (self.id, target_model_id),
+            )
+        )["c"]
+
+    def model_counts(self) -> dict[str | None, int]:
+        """
+        Count how many embeddings the collection holds per model generation.
+
+        Returns:
+            dict: Mapping of model ID to number of embeddings
+        """
+        return {
+            row["model"]: row["c"]
+            for row in self.db.query(
+                """
+            select model, count(*) as c from embeddings
+            where collection_id = ?
+            group by model
+            """,
+                (self.id,),
+            )
+        }
 
     @staticmethod
     def content_hash(input: str | bytes) -> bytes:

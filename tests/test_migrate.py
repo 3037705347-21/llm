@@ -114,6 +114,7 @@ def test_migrations_for_embeddings(db_factory):
         "collection_id": int,
         "id": str,
         "embedding": bytes,
+        "model": str,
         "content": str,
         "content_blob": bytes,
         "content_hash": bytes,

@@ -88,3 +88,36 @@ def m005_add_content_blob(db):
     db["embeddings"].transform(
         column_order=("collection_id", "id", "embedding", "content", "content_blob")
     )
+
+
+@embeddings_migrations()
+def m006_add_embeddings_model(db):
+    # Tracks which embedding model produced each individual row, so a
+    # collection can be re-indexed from one model generation to another
+    # incrementally without losing track of which rows belong to which.
+    db["embeddings"].add_column("model", str)
+    db["embeddings"].transform(
+        column_order=(
+            "collection_id",
+            "id",
+            "embedding",
+            "model",
+            "content",
+            "content_blob",
+            "content_hash",
+            "metadata",
+            "updated",
+        )
+    )
+    # Existing rows were all produced by the collection's current model
+    db.execute("""
+        update embeddings
+        set model = (
+            select collections.model
+            from collections
+            where collections.id = embeddings.collection_id
+        )
+        where model is null
+        """)
+    # Used by generation-scoped searches and "how many rows are stale?" checks
+    db["embeddings"].create_index(["collection_id", "model"])
