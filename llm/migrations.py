@@ -660,6 +660,20 @@ def m025_turn_tools_instance_backfill(db):
             """)
 
 
+@migration
+def m026_instance_used_arguments(db):
+    # When equivalent configurations are merged into one instance, the
+    # surviving row carries only one arguments text. Each reference that
+    # was rebound records the arguments its instance actually had at the
+    # time it ran - NULL means "same as the instance now points to" - so
+    # history can still show the configuration that was in use then.
+    db["turn_tools"].add_column("used_arguments", str)
+    db["tool_instantiations"].add_column("used_arguments", str)
+    # tool_results stopped receiving new rows but legacy rows still
+    # reference instances, so it needs the same snapshot column.
+    db["tool_results"].add_column("used_arguments", str)
+
+
 MESSAGE_TREE_SQL = """
 with recursive msg as (
   select m.hash, m.parent_hash, m.role, m.rowid as rid,

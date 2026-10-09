@@ -48,6 +48,13 @@ from .parts import (
     user,
 )
 from .plugins import load_plugins, pm
+from .reconcile import (
+    ReconcileConflictError,
+    ReconcileError,
+    ReconcileReport,
+    ToolInstanceConfigError,
+    reconcile_tool_instances,
+)
 from .templates import Template
 from .utils import Fragment, schema_dsl
 
@@ -70,11 +77,15 @@ __all__ = [
     "Options",
     "PauseChain",
     "Prompt",
+    "ReconcileConflictError",
+    "ReconcileError",
+    "ReconcileReport",
     "Response",
     "ServerSideTool",
     "Template",
     "Tool",
     "ToolCall",
+    "ToolInstanceConfigError",
     "ToolOutput",
     "ToolResult",
     "Toolbox",
@@ -84,6 +95,7 @@ __all__ = [
     "get_key",
     "get_model",
     "hookimpl",
+    "reconcile_tool_instances",
     "schema_dsl",
     "system",
     "tool_message",

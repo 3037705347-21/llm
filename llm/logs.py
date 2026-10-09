@@ -1544,7 +1544,9 @@ def log_row_extras(store: "LogStore", row: dict) -> dict:
             """
             select tools.id, tools.hash, tools.name, tools.description,
                    tools.input_schema, tool_instances.name as instance_name,
-                   tool_instances.arguments as instance_arguments
+                   coalesce(
+                       turn_tools.used_arguments, tool_instances.arguments
+                   ) as instance_arguments
             from tools join turn_tools on turn_tools.tool_id = tools.id
             left join tool_instances
                 on tool_instances.id = turn_tools.instance_id
@@ -1682,7 +1684,11 @@ def _instances_by_tool_call_id(
         for row in store.db.query(
             f"""
             select tool_instantiations.tool_call_id, tool_instances.name,
-                   tool_instances.plugin, tool_instances.arguments
+                   tool_instances.plugin,
+                   coalesce(
+                       tool_instantiations.used_arguments,
+                       tool_instances.arguments
+                   ) as arguments
             from tool_instantiations
             join tool_instances
                 on tool_instances.id = tool_instantiations.instance_id

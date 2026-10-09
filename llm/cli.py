@@ -72,6 +72,10 @@ from .logs import (
 )
 from .migrations import migrate
 from .plugins import load_plugins, pm
+from .reconcile import (
+    ReconcileError,
+    reconcile_tool_instances,
+)
 from .utils import (
     ensure_fragment,
     extract_fenced_code_block,
@@ -1510,7 +1514,9 @@ def load_conversation(
             """
             select tools.name, tools.plugin, turn_tools.instance_id,
                 tool_instances.name as instance_name,
-                tool_instances.arguments as instance_arguments
+                coalesce(
+                    turn_tools.used_arguments, tool_instances.arguments
+                ) as instance_arguments
             from tools
             join turn_tools on turn_tools.tool_id = tools.id
             left join tool_instances on tool_instances.id = turn_tools.instance_id
@@ -2996,6 +3002,92 @@ def tools_list(tool_defs, json_, model_id, python_tools) -> None:
                 click.echo(f"{tool_info['name']}{tool_info['signature']}\n")
                 if tool_info["description"]:
                     click.echo(textwrap.indent(tool_info["description"], "  ") + "\n")
+
+
+@tools.command(name="reconcile")
+@click.option(
+    "tool_specs",
+    "-T",
+    "--tool",
+    multiple=True,
+    help="Current tool configuration, same syntax as 'llm prompt -T'",
+)
+@click.option(
+    "python_tools",
+    "--functions",
+    multiple=True,
+    help="Python code block or file path defining functions to register as tools",
+)
+@click.option(
+    "model_id",
+    "-m",
+    "--model",
+    help="Model whose server-side tools should be available to -T",
+)
+@click.option("json_", "--json", is_flag=True, help="Output report as JSON")
+def tools_reconcile(tool_specs, python_tools, model_id, json_):
+    """Merge equivalent tool instances and remove unused ones.
+
+    Tool instances whose configurations parse to the same JSON value are
+    the same real instance even when written differently: they are merged
+    into one instance, with every historical turn and tool call rebound
+    to it. Instances no turn, call or the current configuration uses are
+    deleted. Each rebound row keeps the arguments it actually used, so
+    history still shows the configuration that was in effect at the time.
+
+    The change is atomic: a configuration that fails to parse, or a
+    conflict, changes nothing. Repeating the command makes no further
+    changes.
+    """
+    current: list = []
+    if tool_specs or python_tools:
+        model = None
+        if model_id:
+            try:
+                model = get_model(model_id)
+            except UnknownModelError as ex:
+                raise click.ClickException(str(ex))
+        try:
+            gathered = _gather_tools(tool_specs, python_tools, model=model)
+        except ValueError as ex:
+            raise click.ClickException(str(ex))
+        current = [
+            tool for tool in gathered if isinstance(tool, (Toolbox, ServerSideTool))
+        ]
+
+    db = sqlite_utils.Database(logs_db_path())
+    try:
+        report = reconcile_tool_instances(db, current=current or None)
+    except ReconcileError as ex:
+        raise click.ClickException(str(ex))
+
+    if json_:
+        click.echo(
+            json.dumps(
+                {
+                    "merged": report.merged,
+                    "deleted": report.deleted,
+                    "garbage_collected": report.garbage_collected,
+                    "inserted": report.inserted,
+                    "repointed": report.repointed,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if not report.changed:
+        click.echo("Tool instances already reconciled.")
+        return
+    for loser, survivor in sorted(report.merged.items()):
+        click.echo(f"Merged instance {loser} into {survivor}")
+    for instance_id in report.garbage_collected:
+        click.echo(f"Deleted unused instance {instance_id}")
+    for instance_id in report.inserted:
+        click.echo(f"Created instance {instance_id} for current configuration")
+    for table, count in report.repointed.items():
+        if count:
+            click.echo(f"Rebound {count} {table} row(s)")
 
 
 @cli.group(
