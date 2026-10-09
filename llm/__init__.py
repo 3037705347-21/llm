@@ -1,3 +1,4 @@
+import datetime
 import inspect
 import json
 import os
@@ -10,6 +11,7 @@ import click
 
 from .embeddings import Collection
 from .errors import (
+    AliasHistoryError,
     ConversationNotSupported,
     ModelError,
     NeedsKeyException,
@@ -52,6 +54,7 @@ from .templates import Template
 from .utils import Fragment, schema_dsl
 
 __all__ = [
+    "AliasHistoryError",
     "AsyncConversation",
     "AsyncKeyModel",
     "AsyncModel",
@@ -79,11 +82,15 @@ __all__ = [
     "ToolResult",
     "Toolbox",
     "Usage",
+    "alias_rotations_path",
     "assistant",
     "get_async_model",
     "get_key",
     "get_model",
     "hookimpl",
+    "load_alias_rotations",
+    "load_aliases",
+    "record_alias_rotation",
     "schema_dsl",
     "system",
     "tool_message",
@@ -423,19 +430,126 @@ def user_dir():
     return path
 
 
+def aliases_path():
+    "Path to the aliases.json file"
+    return user_dir() / "aliases.json"
+
+
+def alias_rotations_path():
+    """
+    Path to alias_rotations.json, which records every time an alias was
+    switched from one model to another. The backfill uses it to tell
+    which concrete model an alias referred to at the time a log row was
+    written.
+    """
+    return user_dir() / "alias_rotations.json"
+
+
+def _atomic_write_json(path, data):
+    "Write JSON via a temp file + rename, so readers never see a torn file."
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, indent=4) + "\n", "utf-8")
+    os.replace(temporary, path)
+
+
+def load_aliases():
+    """
+    Read the current {alias: model_id} mapping from aliases.json.
+
+    Returns {} if the file does not exist. Raises AliasHistoryError if
+    the file exists but cannot be read or parsed, so callers that are
+    about to derive data from it never do so from a broken file.
+    """
+    path = aliases_path()
+    if not path.exists():
+        return {}
+    try:
+        current = json.loads(path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError) as ex:
+        raise AliasHistoryError(f"Could not read aliases file {path}: {ex}") from ex
+    if not isinstance(current, dict):
+        raise AliasHistoryError(
+            f"Aliases file {path} must contain a JSON object of alias to model"
+        )
+    return current
+
+
+def load_alias_rotations():
+    """
+    Read alias_rotations.json as {alias: [{old, new, datetime}, ...]}.
+
+    Entries are ordered oldest-first. Returns {} if the file does not
+    exist. Raises AliasHistoryError if the file cannot be read or does
+    not have the expected shape.
+    """
+    path = alias_rotations_path()
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError) as ex:
+        raise AliasHistoryError(
+            f"Could not read alias rotation history {path}: {ex}"
+        ) from ex
+    message = (
+        f"Alias rotation history {path} must be a JSON object mapping alias"
+        " names to lists of {{old, new, datetime}} entries"
+    )
+    if not isinstance(raw, dict):
+        raise AliasHistoryError(message)
+    rotations = {}
+    for alias, entries in raw.items():
+        if not isinstance(entries, list):
+            raise AliasHistoryError(message)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise AliasHistoryError(message)
+            try:
+                old = entry["old"]
+                new = entry["new"]
+                rotated_at = entry["datetime"]
+            except (KeyError, TypeError) as ex:
+                raise AliasHistoryError(message) from ex
+            if not all(isinstance(v, str) for v in (old, new, rotated_at)):
+                raise AliasHistoryError(message)
+        rotations[alias] = sorted(entries, key=lambda entry: entry["datetime"])
+    return rotations
+
+
+def record_alias_rotation(alias, old_model, new_model, rotated_at=None):
+    """
+    Append a rotation of alias from old_model to new_model.
+
+    Raises AliasHistoryError if the existing rotation history cannot be
+    read: in that case nothing is written, so an unreadable history is
+    never overwritten.
+    """
+    if rotated_at is None:
+        rotated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rotations = load_alias_rotations()
+    rotations.setdefault(alias, []).append(
+        {"old": old_model, "new": new_model, "datetime": rotated_at}
+    )
+    rotations[alias].sort(key=lambda entry: entry["datetime"])
+    _atomic_write_json(alias_rotations_path(), rotations)
+
+
 def set_alias(alias, model_id_or_alias):
     """
     Set an alias to point to the specified model.
+
+    If the alias previously pointed at a different model, the switch is
+    appended to alias_rotations.json before aliases.json is updated, so
+    the rotation can never be lost. Returns the model_id the alias
+    pointed at before, or None if the alias was new.
+
+    Raises AliasHistoryError if aliases.json or the rotation history
+    cannot be read; in that case neither file is modified.
     """
-    path = user_dir() / "aliases.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text("{}\n")
-    try:
-        current = json.loads(path.read_text())
-    except json.decoder.JSONDecodeError:
-        # We're going to write a valid JSON file in a moment:
-        current = {}
+    current = load_aliases()
+    previous = current.get(alias)
     # Resolve model_id_or_alias to a model_id
     try:
         model = get_model(model_id_or_alias)
@@ -448,25 +562,32 @@ def set_alias(alias, model_id_or_alias):
         except UnknownModelError:
             # Set the alias to the exact string they provided instead
             model_id = model_id_or_alias
+    if previous is not None and previous != model_id:
+        # Record the rotation before flipping aliases.json: a rotation
+        # without the file flip is harmless (the backfill's pre-rotation
+        # window still resolves the old rows), but a file flip without a
+        # rotation loses the only evidence of what the old model was.
+        record_alias_rotation(alias, previous, model_id)
     current[alias] = model_id
-    path.write_text(json.dumps(current, indent=4) + "\n")
+    _atomic_write_json(aliases_path(), current)
+    return previous
 
 
 def remove_alias(alias):
     """
     Remove an alias.
     """
-    path = user_dir() / "aliases.json"
+    path = aliases_path()
     if not path.exists():
         raise KeyError("No aliases.json file exists")
     try:
-        current = json.loads(path.read_text())
+        current = json.loads(path.read_text("utf-8"))
     except json.decoder.JSONDecodeError:
         raise KeyError("aliases.json file is not valid JSON")
     if alias not in current:
         raise KeyError(f"No such alias: {alias}")
     del current[alias]
-    path.write_text(json.dumps(current, indent=4) + "\n")
+    _atomic_write_json(path, current)
 
 
 def encode(values):

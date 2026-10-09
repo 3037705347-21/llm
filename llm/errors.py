@@ -7,4 +7,8 @@ class NeedsKeyException(ModelError):
 
 
 class ConversationNotSupported(ValueError):
-    "A single-turn model was given assistant or tool messages"
+    "A single-turn model was given assistant or tool results"
+
+
+class AliasHistoryError(ValueError):
+    "The aliases file or alias rotation history cannot be read or parsed"

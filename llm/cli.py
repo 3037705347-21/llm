@@ -27,6 +27,7 @@ from click_default_group import DefaultGroup
 from sqlite_utils.utils import Format, rows_from_file
 
 from llm import (
+    AliasHistoryError,
     AsyncConversation,
     AsyncKeyModel,
     AsyncResponse,
@@ -56,6 +57,7 @@ from llm import (
     get_plugins,
     get_template_loaders,
     get_tools,
+    load_alias_rotations,
     remove_alias,
     set_alias,
     set_default_embedding_model,
@@ -66,6 +68,7 @@ from llm.models import ChainResponse, _BaseChainResponse, _BaseConversation
 
 from .logs import (
     LogStore,
+    backfill_resolved_models,
     legacy_log_row_extras,
     log_row_extras,
     merged_log_rows,
@@ -3075,13 +3078,76 @@ def aliases_set(alias, model_id, query):
                 "No model found matching query: " + ", ".join(query)
             )
         model_id = found.model.model_id
-        set_alias(alias, model_id)
+
+    try:
+        previous = set_alias(alias, model_id)
+    except AliasHistoryError as ex:
+        raise click.ClickException(str(ex))
+    switched = previous is not None and previous != model_id
+    if switched:
+        click.echo(
+            f"Alias '{alias}' switched from '{previous}' to '{model_id}'",
+            err=True,
+        )
+    elif query:
         click.echo(
             f"Alias '{alias}' set to model '{model_id}'",
             err=True,
         )
-    else:
-        set_alias(alias, model_id)
+    # Resolve historical logs against the new rotation history. Safe to
+    # rerun: rows with a resolved model already are left alone.
+    try:
+        updated = _backfill_logs_for_aliases()
+    except AliasHistoryError as ex:
+        raise click.ClickException(str(ex))
+    if updated:
+        click.echo(
+            f"Resolved {updated} logged record(s) that used a switched alias",
+            err=True,
+        )
+
+
+@aliases.command(name="backfill")
+def aliases_backfill():
+    """
+    Backfill resolved model names on historical logs
+
+    Uses the recorded alias rotations to fill in the concrete model used
+    by logged prompts whose model is recorded as an alias. Records that
+    already have a resolved model are not modified. This is safe to run
+    repeatedly and can be re-run to finish a backfill that was
+    interrupted partway through.
+    """
+    path = logs_db_path()
+    if not path.exists():
+        click.echo(f"No log database found at {path}")
+        return
+    db = _cli_database(path)
+    migrate(db)
+    try:
+        updated = backfill_resolved_models(db)
+    except AliasHistoryError as ex:
+        raise click.ClickException(str(ex))
+    click.echo(f"Resolved {updated} logged record(s)")
+
+
+@aliases.command(name="history")
+@click.argument("alias", required=False)
+def aliases_history(alias):
+    """
+    Show recorded alias rotations, optionally for one alias
+
+    Each line shows when an alias was switched, the model it used to
+    point at and the model it points at since then.
+    """
+    try:
+        rotations = load_alias_rotations()
+    except AliasHistoryError as ex:
+        raise click.ClickException(str(ex))
+    names = [alias] if alias else sorted(rotations)
+    for name in names:
+        for entry in rotations.get(name, []):
+            click.echo("\t".join([entry["datetime"], name, entry["old"], entry["new"]]))
 
 
 @aliases.command(name="remove")
@@ -4073,6 +4139,16 @@ def _cli_database(*args, **kwargs):
 
 def logs_db_path():
     return user_dir() / "logs.db"
+
+
+def _backfill_logs_for_aliases():
+    "Backfill resolved model names in logs.db; no-op if it does not exist."
+    path = logs_db_path()
+    if not path.exists():
+        return 0
+    db = _cli_database(path)
+    migrate(db)
+    return backfill_resolved_models(db)
 
 
 def get_history(chat_id):

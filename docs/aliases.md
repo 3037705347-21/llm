@@ -97,6 +97,40 @@ The `llm aliases remove <alias>` command will remove the specified alias:
 llm aliases remove mini
 ```
 
+## Switching an alias to another model
+
+Your logs record the model (which may be an alias) that produced each response, alongside a `resolved_model` column holding the concrete model name when it is known. If you repoint an existing alias at a new model, older log entries that just name the alias would otherwise become ambiguous.
+
+To prevent that, every time `llm aliases set` changes an alias from one model to another, the switch is appended to an `alias_rotations.json` file in the LLM configuration directory. The historical logs are then backfilled automatically: entries that used the alias and have no resolved model yet are updated to the concrete model the alias pointed at when they were logged.
+
+For example, switching the `luna` alias:
+
+```bash
+llm aliases set luna gpt-6.0-luna
+```
+will record that `luna` previously pointed at `gpt-5.6-luna` and resolve the older log entries accordingly. Entries that already carry a resolved model name are never modified.
+
+## Viewing alias rotations
+
+To see the recorded rotations for all aliases:
+
+```bash
+llm aliases history
+```
+Pass an alias name to show just that alias:
+```bash
+llm aliases history luna
+```
+
+## Re-running the backfill
+
+The backfill is idempotent: running it again only fills in entries that are still missing a resolved model, so it is safe to run as often as you like. If a backfill is interrupted partway through, re-running it picks up where it left off and converges on the same final state.
+
+```bash
+llm aliases backfill
+```
+The command reports how many log records it resolved. It needs both `aliases.json` and `alias_rotations.json` to be readable; if either file cannot be parsed it exits without modifying the database, so an unreadable file can never leave a half-backfilled log.
+
 ## Viewing the aliases file
 
 Aliases are stored in an `aliases.json` file in the LLM configuration directory.

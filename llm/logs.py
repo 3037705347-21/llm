@@ -45,6 +45,7 @@ from .utils import (
 __all__ = [
     "HASH_PREFIX",
     "LogStore",
+    "backfill_resolved_models",
     "canonical_json",
     "content_hash",
     "message_hash",
@@ -723,6 +724,96 @@ class LogStore:
             for part in chain[-1].parts
             if isinstance(part, ToolCallPart) and not part.server_executed
         ]
+
+
+# -- alias rotation backfill -------------------------------------------
+
+# Tables that record one model call as (model, resolved_model,
+# datetime_utc): the new message store and the legacy tables.
+_BACKFILL_TABLES = ("turns", "responses")
+
+
+def _rotation_windows(rotations):
+    """Turn ordered rotation entries into half-open time windows.
+
+    An entry ``{old: M0, new: M1, datetime: t}`` says the alias meant
+    M0 before t and M1 from t onwards. Chaining the entries for an alias
+    partitions time into ``(-inf, t0) -> old``,
+    ``[t0, t1) -> first new`` ... ``[tn, +inf) -> last new``.
+    """
+    windows = {}
+    for alias, entries in rotations.items():
+        ordered = sorted(entries, key=lambda entry: entry["datetime"])
+        alias_windows: list[tuple[str | None, str | None, str]] = [
+            (None, ordered[0]["datetime"], ordered[0]["old"])
+        ]
+        for i, entry in enumerate(ordered):
+            end = ordered[i + 1]["datetime"] if i + 1 < len(ordered) else None
+            alias_windows.append((entry["datetime"], end, entry["new"]))
+        windows[alias] = alias_windows
+    return windows
+
+
+def _backfill_window(db, table, alias, model_id, start, end):
+    "Fill NULL resolved_model rows in one table for one time window."
+    if not db[table].exists():
+        return 0
+    if "resolved_model" not in db[table].columns_dict:
+        return 0
+    clauses = ["model = :alias", "resolved_model is null"]
+    params: dict[str, Any] = {"alias": alias, "model_id": model_id}
+    if start is not None or end is not None:
+        # A row without a timestamp cannot be placed in a window; leave
+        # it unresolved rather than guessing which model it used.
+        clauses.extend(["datetime_utc is not null", "datetime_utc != ''"])
+    if start is not None:
+        clauses.append("datetime_utc >= :start")
+        params["start"] = start
+    if end is not None:
+        clauses.append("datetime_utc < :end")
+        params["end"] = end
+    sql = "update {table} set resolved_model = :model_id where {where}".format(
+        table=table, where=" and ".join(clauses)
+    )
+    cursor = db.execute(sql, params)
+    return cursor.rowcount
+
+
+def backfill_resolved_models(db) -> int:
+    """Fill missing ``resolved_model`` values on logged model calls.
+
+    Rows whose ``model`` is an alias are resolved to the concrete model
+    the alias pointed at when the row was logged, using
+    alias_rotations.json. Rows that already carry a resolved model are
+    never modified, so running this repeatedly converges: a second run
+    has nothing left to do and a run interrupted after some aliases
+    committed simply resumes on the next invocation.
+
+    Both aliases.json and alias_rotations.json are read and validated
+    before any row is updated, and each alias is updated inside its own
+    transaction, so an unreadable input or a mid-run failure never
+    leaves a half-written database.
+
+    Returns the number of rows updated.
+    """
+    from . import load_alias_rotations, load_aliases
+
+    aliases = load_aliases()
+    rotations = load_alias_rotations()
+
+    plans = _rotation_windows(rotations)
+    # An alias with no rotation on record has, as far as the history
+    # knows, always pointed at its current model.
+    for alias, model_id in aliases.items():
+        plans.setdefault(alias, [(None, None, model_id)])
+
+    updated = 0
+    for alias, windows in plans.items():
+        with db.atomic():
+            for start, end, model_id in windows:
+                for table in _BACKFILL_TABLES:
+                    updated += _backfill_window(db, table, alias, model_id, start, end)
+    return updated
 
 
 def ensure_attachment(db, attachment) -> str:
