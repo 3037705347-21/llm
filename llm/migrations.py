@@ -732,3 +732,12 @@ def m027_turns_response_json(db):
     # response. NULL for turns logged before this column existed and
     # for models that expose no raw payload.
     db["turns"].add_column("response_json", str)
+
+
+@migration
+def m028_fragment_alias_managed_by(db):
+    # NULL marks a manually created alias; a non-NULL value identifies
+    # the manifest (e.g. its file path) that owns the alias, so
+    # `llm fragments sync` can remove only aliases it is responsible
+    # for and leave manual aliases alone.
+    db["fragment_aliases"].add_column("managed_by", str)

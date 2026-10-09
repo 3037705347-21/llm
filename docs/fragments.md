@@ -146,6 +146,32 @@ Use `llm fragments --aliases` to see a full list of fragments that have been ass
 llm fragments --aliases
 ```
 
+(fragments-sync)=
+## Syncing aliases from a manifest
+
+Aliases can also be maintained in a manifest file that you keep in version control, so that everyone on a team converges on the same alias names. The manifest is a JSON or YAML object that maps aliases to the SHA-256 hash IDs of fragments:
+
+```json
+{
+  "docs": "0d6e368f9bc21f8db78c01e192ecf925841a957d8b991f5bf9f6239aa4d81815",
+  "notes": "16b686067375182573e2aa16b5bfc1e64d48350232535d06444537e51f1fd60c"
+}
+```
+Converge the aliases in your local database against that file like this:
+```bash
+llm fragments sync fragment-aliases.json
+```
+The referenced fragments must already be stored in your local database - fragments are stored there automatically whenever you use them in a prompt.
+
+The command converges the database to match the manifest:
+
+- Aliases in the manifest are created, or **repointed** when their hash has changed - aliases always follow content identity (the hash), never a database row ID.
+- Aliases that the manifest used to set but that have been **deleted** from the manifest are removed locally.
+- Aliases you created yourself with `llm fragments set` are **left alone**, as is aliases owned by a different manifest file.
+- Fragment content is **never deleted**, so content referenced by older conversations stays readable via hash IDs and `llm logs --expand` even after an alias is repointed or removed.
+
+The whole update runs in a single transaction: if the manifest references a hash that is not stored in the local database, the command fails without changing anything - use the fragment once to store it, then run the command again. The command is idempotent and safe to run repeatedly, including after an interrupted run; rerunning it converges on the same state. Output reports each alias that was added, updated or removed, or confirms that everything is already in sync.
+
 (fragments-logs)=
 ## Viewing fragments in your logs
 

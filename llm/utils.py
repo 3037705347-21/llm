@@ -507,6 +507,140 @@ def ensure_fragment(db, content):
     ).fetchone()[0]
 
 
+FRAGMENT_ALIAS_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+FRAGMENT_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+
+
+class FragmentAliasManifestError(ValueError):
+    pass
+
+
+def reconcile_fragment_aliases(db, desired, managed_by):
+    """
+    Converge fragment aliases on a checked-in manifest.
+
+    ``desired`` maps alias names to fragment SHA-256 hashes - aliases are
+    bound to content identity, never to a database row id. Every alias in
+    the manifest is created or repointed to the fragment with that hash,
+    and claimed for ``managed_by`` (the identity of the manifest, e.g.
+    its file path). Aliases previously claimed by ``managed_by`` that are
+    no longer listed are removed.
+
+    Manually created aliases (``managed_by`` is NULL) and aliases owned
+    by a different manifest are left untouched, and no fragment content
+    is ever deleted - so conversations that referenced repointed or
+    removed aliases stay readable via the fragment hashes.
+
+    The whole reconciliation runs in one transaction and only writes
+    after every hash has been resolved against the database, so a
+    failure (including an interrupted run) leaves nothing half-applied
+    and rerunning converges on the same state.
+
+    Returns a summary dict with the alias names that were "added",
+    "updated", "removed" and left "unchanged".
+    """
+    if not isinstance(managed_by, str) or not managed_by:
+        raise FragmentAliasManifestError("managed_by must be a non-empty string")
+    if not isinstance(desired, dict):
+        raise FragmentAliasManifestError(
+            "Manifest must be an object mapping fragment aliases to SHA-256 hashes"
+        )
+    for alias, hash_id in desired.items():
+        if not isinstance(alias, str) or not FRAGMENT_ALIAS_RE.match(alias):
+            raise FragmentAliasManifestError(
+                f"Invalid fragment alias in manifest: {alias!r}"
+            )
+        if not isinstance(hash_id, str) or not FRAGMENT_HASH_RE.match(hash_id):
+            raise FragmentAliasManifestError(
+                f"Manifest alias {alias!r} must point at a 64 character SHA-256 hash"
+            )
+
+    # Resolve every content identity before opening the write transaction
+    # so a missing fragment aborts the run with zero changes.
+    unique_hashes = list(dict.fromkeys(desired.values()))
+    hash_to_id = {}
+    if unique_hashes:
+        placeholders = ", ".join(f":h{i}" for i in range(len(unique_hashes)))
+        rows = db.execute(
+            f"select hash, id from fragments where hash in ({placeholders})",
+            {f"h{i}": h for i, h in enumerate(unique_hashes)},
+        ).fetchall()
+        hash_to_id = {row[0]: row[1] for row in rows}
+    missing = [h for h in unique_hashes if h not in hash_to_id]
+    if missing:
+        raise FragmentAliasManifestError(
+            "Manifest references fragment hashes that are not stored in this "
+            "database yet: " + ", ".join(missing)
+        )
+
+    summary = {"added": [], "updated": [], "removed": [], "unchanged": []}
+    with db.atomic():
+        current = {
+            row["alias"]: (row["fragment_id"], row["managed_by"])
+            for row in db.query(
+                "select alias, fragment_id, managed_by from fragment_aliases"
+            )
+        }
+        for alias, hash_id in desired.items():
+            fragment_id = hash_to_id[hash_id]
+            if alias not in current:
+                db.execute(
+                    """
+                    insert into fragment_aliases (alias, fragment_id, managed_by)
+                    values (:alias, :fragment_id, :managed_by)
+                    """,
+                    {
+                        "alias": alias,
+                        "fragment_id": fragment_id,
+                        "managed_by": managed_by,
+                    },
+                )
+                summary["added"].append(alias)
+                continue
+            old_fragment_id, old_managed_by = current[alias]
+            if old_fragment_id != fragment_id or old_managed_by != managed_by:
+                db.execute(
+                    """
+                    update fragment_aliases
+                    set fragment_id = :fragment_id, managed_by = :managed_by
+                    where alias = :alias
+                    """,
+                    {
+                        "alias": alias,
+                        "fragment_id": fragment_id,
+                        "managed_by": managed_by,
+                    },
+                )
+                summary["updated"].append(alias)
+            else:
+                summary["unchanged"].append(alias)
+
+        # Only delete aliases this manifest owns; manual aliases and
+        # aliases owned by other manifests survive even if unlisted.
+        owned = [
+            row[0]
+            for row in db.execute(
+                "select alias from fragment_aliases where managed_by = :managed_by",
+                {"managed_by": managed_by},
+            ).fetchall()
+        ]
+        summary["removed"] = sorted(set(owned) - set(desired))
+        if summary["removed"]:
+            placeholders = ", ".join(f":a{i}" for i in range(len(summary["removed"])))
+            params = {"managed_by": managed_by}
+            params.update(
+                {f"a{i}": alias for i, alias in enumerate(summary["removed"])}
+            )
+            db.execute(
+                f"""
+                delete from fragment_aliases
+                where managed_by = :managed_by and alias in ({placeholders})
+                """,
+                params,
+            )
+    return summary
+
+
 def ensure_tool(db, tool):
     sql = """
     insert into tools (hash, name, description, input_schema, plugin)

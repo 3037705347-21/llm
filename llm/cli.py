@@ -73,6 +73,7 @@ from .logs import (
 from .migrations import migrate
 from .plugins import load_plugins, pm
 from .utils import (
+    FragmentAliasManifestError,
     ensure_fragment,
     extract_fenced_code_block,
     find_unused_key,
@@ -84,6 +85,7 @@ from .utils import (
     mimetype_from_string,
     multi_schema,
     output_rows_as_json,
+    reconcile_fragment_aliases,
     resolve_schema_input,
     schema_dsl,
     schema_summary,
@@ -3249,6 +3251,58 @@ def fragments_remove(alias):
     db = _cli_database(logs_db_path())
     migrate(db)
     db.execute("delete from fragment_aliases where alias = :alias", {"alias": alias})
+
+
+@fragments.command(name="sync")
+@click.argument(
+    "manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path),
+)
+def fragments_sync(manifest):
+    """
+    Reconcile fragment aliases against a manifest file
+
+    The manifest is a JSON or YAML object that maps aliases to the
+    SHA-256 hashes of the fragments they should point at, for example:
+
+    \b
+        {
+          "docs": "0d6e368f9bc21f8db78c01e192ecf925...",
+          "notes": "16b686067375182573e2aa16b5bfc1e6..."
+        }
+
+    Aliases in the manifest are created or repointed by content hash,
+    and aliases the manifest used to own but no longer lists are
+    removed. Aliases created manually with `llm fragments set` are
+    left alone, and fragment content is never deleted, so older
+    conversations stay readable. The command is transactional and can
+    safely be run repeatedly.
+
+    \b
+        llm fragments sync fragment-aliases.json
+    """
+    try:
+        desired = yaml.safe_load(manifest.read_text())
+    except (OSError, yaml.YAMLError) as ex:
+        raise click.ClickException(f"Could not read manifest {manifest}: {ex}")
+    db = _cli_database(logs_db_path())
+    migrate(db)
+    managed_by = str(manifest.resolve())
+    try:
+        summary = reconcile_fragment_aliases(db, desired, managed_by)
+    except FragmentAliasManifestError as ex:
+        raise click.ClickException(str(ex))
+    changed = False
+    for label, key in (
+        ("Added", "added"),
+        ("Updated", "updated"),
+        ("Removed", "removed"),
+    ):
+        for alias in summary[key]:
+            changed = True
+            click.echo(f"{label} alias: {alias}")
+    if not changed:
+        click.echo("Fragment aliases already in sync")
 
 
 @fragments.command(name="loaders")

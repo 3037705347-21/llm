@@ -775,6 +775,7 @@ Commands:
   remove   Remove a fragment alias
   set      Set an alias for a fragment
   show     Display the fragment stored under an alias or hash
+  sync     Reconcile fragment aliases against a manifest file
 ```
 
 (help-fragments-list)=
@@ -831,6 +832,33 @@ Usage: llm fragments remove [OPTIONS] ALIAS
   Example usage:
 
       llm fragments remove docs
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-fragments-sync)=
+#### llm fragments sync --help
+```
+Usage: llm fragments sync [OPTIONS] MANIFEST
+
+  Reconcile fragment aliases against a manifest file
+
+  The manifest is a JSON or YAML object that maps aliases to the SHA-256 hashes
+  of the fragments they should point at, for example:
+
+      {
+        "docs": "0d6e368f9bc21f8db78c01e192ecf925...",
+        "notes": "16b686067375182573e2aa16b5bfc1e6..."
+      }
+
+  Aliases in the manifest are created or repointed by content hash, and aliases
+  the manifest used to own but no longer lists are removed. Aliases created
+  manually with `llm fragments set` are left alone, and fragment content is
+  never deleted, so older conversations stay readable. The command is
+  transactional and can safely be run repeatedly.
+
+      llm fragments sync fragment-aliases.json
 
 Options:
   -h, --help  Show this message and exit.
